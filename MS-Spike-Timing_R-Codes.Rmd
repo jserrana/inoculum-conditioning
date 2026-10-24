@@ -1,0 +1,5622 @@
+---
+Title: "Spike-timing experiment"
+Author: "Joeselle Serrana"
+Date: "02/10/2025"
+output: html_document
+editor_options: 
+  chunk_output_type: console 
+---
+
+## STEP 0: Load required library and set working directory  
+
+```{r}
+library("dada2"); packageVersion("dada2") ## For processing amplicon sequence data.
+library("phyloseq"); library("microeco") ## For data manipulation, analysis and visualization. Visit https://github.com/ChiLiubio/microeco for more details.
+
+#setwd("~/Library/Mobile Documents/com~apple~CloudDocs/Documents/(Draft) Spike-Timing/MS-Spike-Timing_Analysis")
+setwd("C:/Users/JoeselleSerrana/iCloudDrive/Documents/(Draft) Spike-Timing/MS-Spike-Timing_Analysis")
+
+mco <- readRDS("src/mco.RDS") ## [START FROM STEP 4...] Read microtable object.
+col.type <- c("Field" = "#2CA25F", "Spike" = "#D7301F", "Harvest" = "#756BB1", 
+              "Sorption" = "#8C510A", "Hydrolysis" = "#7F7F7F")
+
+col.category <- c("Field" = "#2CA25F", 
+                  "Spike - 0 h"  = "#FEE0D2", "Spike - 24 h" = "#FC9272", 
+                  "Spike - 48 h" = "#EF3B2C", "Spike - 72 h" = "#99000D", 
+                  "Harvest - 0 h"  = "#DADAEB", "Harvest - 24 h" = "#BCBDDC", 
+                  "Harvest - 48 h" = "#9E9AC8", "Harvest - 72 h" = "#6A51A3", 
+                  "Sorption"   = "#8C510A", "Hydrolysis" = "#7F7F7F")
+```
+
+## ########################################################## ##
+##                                                            ##
+##           AMPLICON ANALYSIS - START FROM HERE!             ##
+##                                                            ##
+## ########################################################## ##
+### STEP 1: Amplicon sequence processing w/ DADA2 
+
+```{r, eval = FALSE}
+## STEP 0: Copy raw reads to ./data directory.
+
+## Read processing for 16S amplicon sequence data.
+#flist <- list.files("data/raw-reads/result_X204SC24113481-Z01-F002/01.RawData/", "^.+[.]E*fastq.gz", full.names = TRUE, recursive = TRUE)
+#file.copy(flist, "data/raw-reads/")
+
+## STEP 1a: Read quality assessment: Plot read quality
+
+## Sort the file names to ensure that the names for the corresponding forward/reverse reads are in same order and store them in two variables.
+fnFs <- sort(list.files("data/raw-reads", pattern = "_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files("data/raw-reads", pattern = "_2.fastq.gz", full.names = TRUE))
+
+## Extract sample names from the filenames, assuming filenames have the format: SAMPLENAME_XXX.fastq.qz
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+## Plot average quality scores for forward/reverse reads. The script below will plot samples 1 to 8 only. Change the number to include more files.
+plotQualityProfile(fnFs[1:6]); plotQualityProfile(fnRs[1:6])
+
+## STEP 1b: Quality filtering: Filter reads based on length and maxee
+
+## Place filtered files in the "filtered-reads/" subdirectory.
+filtFs <- file.path("data/filtered-reads", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path("data/filtered-reads", paste0(sample.names, "_R_filt.fastq.gz"))
+
+## No need for "trimLeft" since adapter and primer barcodes have been truncated from the raw reads.
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     maxN = 0,
+                     maxEE = c(2,2), 
+                     truncQ = 2,
+                     truncLen = c(220, 200), #minLen = 100,
+                     rm.phix = TRUE,
+                     compress = TRUE, 
+                     multithread = TRUE)  ## On Windows set multithread = FALSE
+
+head(out)
+
+## STEP 1c: Quality filtering: Learn error rates
+set.seed(100)
+
+## Estimate the error model for DADA2 algorithm using forward/reverse reads.
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+## Plot the error rates for all possible base transitions.
+plotErrors(errF, nominalQ = TRUE)
+
+## STEP 1d: Dereplicate and denoise reads
+
+## Dereplicate FASTQ files for both forward and reverse reads to speed up computation.
+exists <- file.exists(filtFs)
+
+derepFs <- derepFastq(filtFs[exists], verbose = TRUE)
+derepRs <- derepFastq(filtRs[exists], verbose = TRUE)
+
+## Name the derep-class objects by the sample names.
+names(derepFs) <- sample.names[exists]
+names(derepRs) <- sample.names[exists]
+
+## At this step, the core sample inference algorithm is applied to the dereplicated data.
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+dadaFs[[1]] # Inspect the returned dada-class object.
+
+## STEP 1e: Merge paired-end reads and construct sequence table
+
+## Merge denoised reads.
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+head(mergers[[1]]) # Inspect the merger data.frame from the first sample.
+
+## Organize sequence variants into a sequence table.
+seqtab <- makeSequenceTable(mergers)
+
+dim(seqtab) # The sequences being tabled vary in length.
+table(nchar(getSequences(seqtab))) # Inspect distribution of sequence lengths.
+
+## STEP 1f: Chimera filtering
+## Perform de novo chimera sequence detection and removal.
+seqtab.nochim <- removeBimeraDenovo(seqtab, 
+                                    method = "consensus", 
+                                    multithread = TRUE,
+                                    verbose = TRUE) # Remove chimera.
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+## STEP 1g: Singleton filtering
+## Remove all ASVs present only once (or less) across all samples:
+
+is1 <- colSums(seqtab.nochim) <= 10
+seqtab.nosing <- seqtab.nochim[,!is1]
+
+## Extract read processing information (counts)
+
+getN <- function(x) sum(getUniques(x)) # Track reads through the pipeline.
+track <- cbind(out, 
+               sapply(dadaFs, getN), 
+               sapply(dadaRs, getN), 
+               sapply(mergers, getN),
+               rowSums(seqtab.nochim),
+               rowSums(seqtab.nosing))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim", "nosing")
+rownames(track) <- sample.names; head(track)
+
+## Extract ASV-Table with sequence and abundance/sample information
+## Save non-chimeric ASV table.
+
+saveRDS(seqtab.nochim, "src/dada2/seqtab.nochim.RDS")
+saveRDS(seqtab.nosing, "src/dada2/seqtab.nosing.RDS")
+
+write.table(track, "src/dada2/read_counts.tsv") ## Read counts per processing step.
+write.table(t(seqtab.nosing), "src/dada2/asv_table.tsv") ## Transposed seqtab.nochim file.
+```
+
+### STEP 2: Taxonomic assignment, and phylognetic analysis
+ 
+```{r, eval = FALSE}
+## STEP 2a: Assign taxonomic with the GTDB database
+
+set.seed(100) # Initialize random number generator for reproducibility
+seqtab.nosing <- readRDS("src/dada2/seqtab.nosing.RDS") # Read saved RDS file if run not saved.
+
+## Assign taxonomy using GTDB (DADA2 formatted 16S rRNA gene sequences for both bacteria & archaea) from https://zenodo.org/records/4735821 (previously downloaded in the data/database/ directory).
+taxa <- assignTaxonomy(seqtab.nosing, "data/database/silva_nr99_v138.2_toSpecies_trainset.fa.gz", multithread = TRUE)
+#colnames(taxa) <- c("Kingdom", "Phylum","Class", "Order", "Family", "Genus", "Species"); unname(taxa)
+
+## Save taxonomic assignment.
+saveRDS(taxa, "src/dada2/taxa.RDS")
+
+## STEP 2b: Phylogenetic analysis
+
+## To infer phylogenetic relations, sequences were aligned using AlignSeqs from the DECIPHER package (Wright, 2016), and used in FastTree (Price et al., 2010) to build an approximately maximum-likelihood phylogenetic tree.
+
+library("DECIPHER")
+library("Biostrings")
+
+set.seed(100) # Initialize random number generator for reproducibility
+seqtab.nosing <- readRDS("src/dada2/seqtab.nosing.RDS") # Read saved RDS file if run not saved.
+
+## Run sequence alignment (MSA) using DECIPHER.
+sequences <- getSequences(seqtab.nosing)
+names(sequences) <- sequences ## Extract sequences from DADA2 output
+
+alignment <- AlignSeqs(DNAStringSet(sequences), anchor = NA)
+
+saveRDS(sequences, "src/dada2/sequences.RDS") ## Save alignment.
+saveRDS(alignment, "src/dada2/alignment.RDS") ## Save alignment.
+
+writeXStringSet(DNAStringSet(sequences), file = "src/dada2/sequences.fasta") ## Save the alignment as FASTA file
+writeXStringSet(alignment, file = "src/dada2/alignment.fasta") ## Save the alignment as FASTA file
+
+## STEP 2c: FastTree v2.1.11 (https://microbesonline.org/fasttree/)
+$ module load fastree
+$ FastTree -gtr -nt alignment.fasta > fasttree.tree
+## Save tree file at the "src/fasttree/" subdirectory.
+```
+ 
+### STEP 3: Prepare input data for downstream analysess
+
+```{r metadata}
+## Import sample data from Excel file.
+
+library("readxl"); library("tibble"); library("magrittr")
+ 
+# Read the Excel file
+metadata <- read_excel("../MS-Spike-Timing_Supplementary-Tables.xlsx", sheet = "S1 Metadata")
+
+# Convert the first column to row names
+metadata <- as.data.frame(metadata); metadata <- column_to_rownames(metadata, var = colnames(metadata)[1])
+
+## STEP 3b: Import as phyloseq object for easier data processing.
+
+## Create phyloseq object: contains OTU table (taxa abundances), sample metadata, taxonomy table (mapping between OTUs and higher-level taxonomic classifications), and phylogenetic tree (relations between the taxa).
+seqtab.nosing <- readRDS("src/dada2/seqtab.nosing.RDS") ## Read otu table if run not saved.
+taxa <- readRDS("src/dada2/taxa.RDS") # Read saved taxonomic annotation file if run not saved.
+tree <- read_tree("src/fasttree/fasttree.tree") ## Import tree file if fasttree was used.
+
+## Cresate phloseq object.
+psq <- phyloseq(otu_table(seqtab.nosing, taxa_are_rows = FALSE), tax_table(as.matrix(taxa)), phy_tree(tree), sample_data(metadata))
+psq 
+
+## ASVs renamed to more convenient shorter form (e.g., ASV100), and actual ASV sequences stored as a DNAStringSet (refseq slot).
+dna <- Biostrings::DNAStringSet(taxa_names(psq)); names(dna) <- taxa_names(psq)
+
+psq <- merge_phyloseq(psq, dna); taxa_names(psq) <- paste0("ASV", seq(ntaxa(psq)))
+
+## Root the phylogenetic tree to calculate phylogeny based diversity metrics.
+set.seed(0327)
+phy_tree(psq) <- ape::root(phy_tree(psq), sample(taxa_names(psq), 1), resolve.root = TRUE); ape::is.rooted(phy_tree(psq)); psq
+
+## Save taxonomic assignment.
+saveRDS(psq, "src/dada2/psq.RDS")
+
+## STEP 3c: Initial data filtering and transformation.
+
+## Standardize abundances to the median sequencing depth.
+total <- median(sample_sums(psq)); standf <- function(x, t = total) round(t * (x / sum(x)))
+psq.median <- transform_sample_counts(psq, standf)
+
+## STEP 3d: Transform phyloseq object to a microtable for microeco R package analyses.
+
+## Create a microtable object and perform additional filters, i.e., removing OTUs with the taxonomic assignments “mitochondria” or “chloroplast”, and making the ASV and sample information consistent across all files in the dataset object with the function tidy_dataset to trim the dataset.
+mco <- file2meco::phyloseq2meco(psq.median); mco$filter_pollution(taxa = c("mitochondria", "chloroplast")); mco$tidy_dataset(); print(mco)
+
+## use R subset function to filter taxa in tax_table.
+#mco$tax_table %<>% base::subset(Kingdom == "k__Archaea" | Kingdom == "k__Bacteria"); mco$tidy_dataset()
+#print(mco)
+
+mco$tax_table$Species <- ifelse(mco$tax_table$Species == "s__" & grepl("^g__$", mco$tax_table$Genus), paste0("s__", sub("g__", "", mco$tax_table$Genus)), 
+                                    ifelse(mco$tax_table$Species == "s__", paste0("s__", sub("g__", "", mco$tax_table$Genus), " sp."), 
+                                           paste0("s__", sub("g__", "", mco$tax_table$Genus), sub("s__", " ", mco$tax_table$Species))))
+
+## For the taxonomic dataset: Add "unclassified" name to filtered out annotations if higher taxa level is available (e.g. s__Unclassified Ruminococcaceae).
+mco$tax_table %<>% tidy_taxonomy
+tmp <- mco$tax_table; for(i in 1:nrow(tmp)){if(any(grepl("__$", tmp[i, ]))){matchall <- grep("__$", tmp[i, ])
+tmp[i, matchall] <- paste0(tmp[i, matchall], "Unc. ", gsub(".__", "", tmp[i, matchall[1] - 1]))}}
+mco$tax_table <- tmp
+
+mco$tax_table$Species <- ifelse(grepl("^s__Unc. ", mco$tax_table$Species), paste0(mco$tax_table$Species, " sp."), mco$tax_table$Species)
+print(mco)
+
+## STEP 3e: Calculate abundance, alpha and beta diversity estimates.
+mco$cal_abund(); class(mco$taxa_abund) ## Calculate the taxa abundance at each taxonomic rank using cal_abund().
+mco$cal_alphadiv(PD = TRUE); class(mco$alpha_diversity) ## Calculate the Alpha diversity w/ Faith's phylogenetic diversity.
+mco$cal_betadiv(unifrac = TRUE); class(mco$beta_diversity) ## Create trans_beta object and measure parameter - dataset$beta_diversity
+print(mco)
+
+## Extract ASV-Table with sequence, abundance/sample and taxonomic information.
+write.csv(cbind(mco$otu_table, mco$tax_table), "src/final_asv_table.tsv", quote = FALSE)
+saveRDS(mco, "src/mco.RDS") # Save microtable used for downstream analyses.
+```
+
+## ########################################################## ##
+##                                                            ##
+##          DOWNSTREAM ANALYSES - START FROM HERE!            ##
+##                                                            ##
+## ########################################################## ##
+
+## Figure 1: Inoculum conditioning generated distinct microbial states
+
+### Figure 1A: Experimental design schematic
+
+```{r}
+# Figure created with graphics from FigureLabs.
+```
+
+### Supplementary Figure S1: Rarefaction curves
+
+```{r}
+library(MicrobiotaProcess); library(ggplot2); library(file2meco)
+
+dataset <- clone(mco); psq <- meco2phyloseq(dataset)
+rareres <- get_rarecurve(obj = psq, chunks = 1000); saveRDS(rareres, "src/rareres.RDS")
+rareres <- readRDS("src/rareres.RDS")
+
+# Rarefaction plot
+
+sf1 <- ggrarecurve(obj = rareres, indexNames = c("Observe", "Chao1", "Shannon"), shadow = TRUE, factorNames = "Type") +
+       scale_color_manual(values = col.type) + scale_fill_manual(values = col.type) +
+       labs(x = "Sequencing depth", y = "Diversity estimate", color = "Type", fill = "Type") + theme_bw() +
+       theme(panel.grid.minor = element_blank(), strip.background = element_blank(), 
+             strip.text = element_text(size = 12, face = "bold"), axis.text = element_text(color = "black"), 
+             legend.position = "right",
+             legend.title = element_text(face = "bold"))
+
+sf1
+```
+
+### Figure 1B: Dominant phyla stacked barplot
+
+```{r}
+library(microeco)
+library(ggplot2)
+
+# ====================================================
+# Figure 1B: Dominant phyla composition during conditioning
+# ====================================================
+
+# Clone dataset
+mco_f1 <- clone(mco)
+
+# Keep only Field + Spike samples
+keep_samples <- rownames(
+  subset(
+    mco_f1$sample_table,
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+# Subset dataset
+mco_f1$sample_table <- mco_f1$sample_table[keep_samples, ]
+mco_f1$otu_table <- mco_f1$otu_table[, keep_samples]
+
+# Recalculate abundance
+mco_f1$cal_abund()
+
+# Set order
+mco_f1$sample_table$Category <- factor(
+  mco_f1$sample_table$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+)
+
+# Mean phylum abundances
+t1 <- trans_abund$new(
+  dataset = mco_f1,
+  taxrank = "Phylum",
+  ntaxa = 8,
+  groupmean = "Category",
+  group_morestats = TRUE
+)
+
+# Plot
+p1b <- t1$plot_bar(color_values = paletteer::paletteer_d("basetheme::brutal"),
+  others_color = "grey70",
+  legend_text_italic = FALSE
+) +
+  scale_x_discrete(
+    labels = c(
+      "Field",
+      "0 h",
+      "24 h",
+      "48 h",
+      "72 h"
+    )
+  ) +
+  geom_vline(
+    xintercept = 1.5,
+    linetype = "dashed",
+    linewidth = 0.5,
+    colour = "grey40"
+  ) +
+  annotate(
+    "text",
+    x = 3.5,
+    y = 107,
+    label = "Conditioned inocula",
+    size = 4
+  ) +
+  labs(
+    x = "Conditioning time",
+    y = "Relative abundance (%)",
+    fill = "Phylum"
+  ) +
+  coord_cartesian(
+    ylim = c(0, 110),
+    clip = "off"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(size = 12
+    ),
+    axis.title.x = element_blank(),
+    legend.title = element_text(face = "bold"),
+    plot.margin = margin(
+      t = 15,
+      r = 10,
+      b = 10,
+      l = 10
+    )
+  )
+ 
+p1b
+```
+
+### Fig 1C: Alpha diversity
+
+```{r}
+library(microeco)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(tibble)
+
+# ====================================================
+# Figure 1C: Alpha diversity during conditioning
+# ====================================================
+
+# Subset dataset
+mco_f1 <- clone(mco)
+
+keep_samples <- rownames(
+  subset(
+    mco_f1$sample_table,
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+mco_f1$sample_table <- mco_f1$sample_table[keep_samples, ]
+mco_f1$otu_table <- mco_f1$otu_table[, keep_samples]
+
+# Recalculate alpha diversity
+mco_f1$cal_alphadiv()
+
+# Alpha table
+alpha <- mco_f1$alpha_diversity %>%
+  rownames_to_column("Sample") %>%
+  left_join(
+    mco_f1$sample_table %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  ) %>%
+  filter(
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+
+# Relabel categories
+alpha$Category <- factor(
+  alpha$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  ),
+  labels = c(
+    "Field",
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# Colors
+col.f1 <- c(
+  "Field" = "#2CA25F",
+  "0 h"   = "#FEE0D2",
+  "24 h"  = "#FC9272",
+  "48 h"  = "#EF3B2C",
+  "72 h"  = "#99000D"
+)
+
+# ====================================================
+# Summary statistics
+# ====================================================
+
+alpha.summary <- alpha %>%
+  group_by(Category) %>%
+  summarise(
+    Observed_median = median(Observed),
+    Observed_mean   = mean(Observed),
+    Observed_sd     = sd(Observed),
+
+    Shannon_median  = median(Shannon),
+    Shannon_mean    = mean(Shannon),
+    Shannon_sd      = sd(Shannon),
+
+    Pielou_median   = median(Pielou),
+    Pielou_mean     = mean(Pielou),
+    Pielou_sd       = sd(Pielou),
+
+    .groups = "drop"
+  )
+
+# Common theme
+fig_theme <- theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+# ====================================================
+# Richness
+# ====================================================
+
+p.rich <- ggplot() +
+
+  geom_errorbar(
+    data = alpha.summary,
+    aes(
+      Category,
+      ymin = Observed_mean - Observed_sd,
+      ymax = Observed_mean + Observed_sd,
+      colour = Category
+    ),
+    width = 0
+  ) +
+
+  geom_line(
+    data = alpha.summary,
+    aes(
+      Category,
+      Observed_median,
+      group = 1
+    ),
+    colour = "black",
+    linewidth = 0.7
+  ) +
+
+  geom_point(
+    data = alpha.summary,
+    aes(
+      Category,
+      Observed_median,
+      fill = Category
+    ),
+    shape = 21,
+    size = 4,
+    colour = "black"
+  ) +
+
+  geom_point(
+    data = alpha,
+    aes(
+      Category,
+      Observed,
+      colour = Category
+    ),
+    alpha = 0.5,
+    size = 2
+  ) +
+
+  scale_colour_manual(values = col.f1) +
+  scale_fill_manual(values = col.f1) +
+
+  labs(
+    x = NULL,
+    y = "Richness",
+    subtitle = "KW p = 0.287"
+  ) +
+
+  fig_theme
+
+# ====================================================
+# Shannon
+# ====================================================
+
+p.shan <- ggplot() +
+
+  geom_errorbar(
+    data = alpha.summary,
+    aes(
+      Category,
+      ymin = Shannon_mean - Shannon_sd,
+      ymax = Shannon_mean + Shannon_sd,
+      colour = Category
+    ),
+    width = 0
+  ) +
+
+  geom_line(
+    data = alpha.summary,
+    aes(
+      Category,
+      Shannon_median,
+      group = 1
+    ),
+    colour = "black",
+    linewidth = 0.7
+  ) +
+
+  geom_point(
+    data = alpha.summary,
+    aes(
+      Category,
+      Shannon_median,
+      fill = Category
+    ),
+    shape = 21,
+    size = 4,
+    colour = "black"
+  ) +
+
+  geom_point(
+    data = alpha,
+    aes(
+      Category,
+      Shannon,
+      colour = Category
+    ),
+    alpha = 0.5,
+    size = 2
+  ) +
+
+  stat_pvalue_manual(
+    data.frame(
+      group1 = "0 h",
+      group2 = "48 h",
+      y.position = max(alpha$Shannon) * 1.08,
+      label = "*"
+    ),
+    label = "label"
+  ) +
+
+  scale_colour_manual(values = col.f1) +
+  scale_fill_manual(values = col.f1) +
+
+  labs(
+    x = NULL,
+    y = "Shannon diversity",
+    subtitle = "KW p = 0.038"
+  ) +
+
+  fig_theme
+
+# ====================================================
+# Evenness
+# ====================================================
+
+p.even <- ggplot() +
+
+  geom_errorbar(
+    data = alpha.summary,
+    aes(
+      Category,
+      ymin = Pielou_mean - Pielou_sd,
+      ymax = Pielou_mean + Pielou_sd,
+      colour = Category
+    ),
+    width = 0
+  ) +
+
+  geom_line(
+    data = alpha.summary,
+    aes(
+      Category,
+      Pielou_median,
+      group = 1
+    ),
+    colour = "black",
+    linewidth = 0.7
+  ) +
+
+  geom_point(
+    data = alpha.summary,
+    aes(
+      Category,
+      Pielou_median,
+      fill = Category
+    ),
+    shape = 21,
+    size = 4,
+    colour = "black"
+  ) +
+
+  geom_point(
+    data = alpha,
+    aes(
+      Category,
+      Pielou,
+      colour = Category
+    ),
+    alpha = 0.5,
+    size = 2
+  ) +
+
+  stat_pvalue_manual(
+    data.frame(
+      group1 = "Field",
+      group2 = "48 h",
+      y.position = max(alpha$Pielou) * 1.08,
+      label = "*"
+    ),
+    label = "label"
+  ) + 
+
+  scale_colour_manual(values = col.f1) +
+  scale_fill_manual(values = col.f1) +
+
+  labs(
+    x = NULL,
+    y = "Evenness",
+    subtitle = "KW p = 0.037"
+  ) +
+
+  fig_theme
+
+# ====================================================
+# Combine
+# ====================================================
+
+p1c <- p.rich + p.shan + p.even +
+  plot_layout(ncol = 3)
+
+p1c
+```
+
+### Fig 1D: PCoA (Weighted UniFrac)
+
+```{r}
+library(ape)
+library(vegan)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+# ====================================================
+# Figure 1D
+# Weighted UniFrac PCoA
+# ====================================================
+
+# Samples
+keep_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+# Metadata
+meta <- mco$sample_table[keep_samples, ]
+
+meta$Category <- factor(
+  meta$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  ),
+  labels = c(
+    "Field",
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# Colors
+col.f1 <- c(
+  "Field" = "#2CA25F",
+  "0 h"   = "#FEE0D2",
+  "24 h"  = "#FC9272",
+  "48 h"  = "#EF3B2C",
+  "72 h"  = "#99000D"
+)
+
+# ====================================================
+# Weighted UniFrac
+# ====================================================
+
+wuni <- mco$beta_diversity$wei_unifrac[
+  keep_samples,
+  keep_samples
+]
+
+dist.mat <- as.dist(wuni)
+
+# ====================================================
+# PCoA
+# ====================================================
+
+pcoa <- ape::pcoa(dist.mat)
+
+scores <- as.data.frame(
+  pcoa$vectors[, 1:2]
+)
+
+scores$Sample <- rownames(scores)
+
+scores <- left_join(
+  scores,
+  meta %>%
+    rownames_to_column("Sample"),
+  by = "Sample"
+)
+
+# Percent variance
+pc1 <- round(
+  pcoa$values$Relative_eig[1] * 100,
+  1
+)
+
+pc2 <- round(
+  pcoa$values$Relative_eig[2] * 100,
+  1
+)
+
+# ====================================================
+# PERMANOVA
+# ====================================================
+
+perm <- adonis2(
+  dist.mat ~ Category,
+  data = meta,
+  permutations = 999
+)
+
+perm_r2 <- round(
+  perm$R2[1],
+  3
+)
+
+perm_p <- signif(
+  perm$`Pr(>F)`[1],
+  3
+)
+
+# ====================================================
+# Convex hulls
+# ====================================================
+
+hulls <- scores %>%
+  group_by(Category) %>%
+  slice(chull(Axis.1, Axis.2))
+
+# ====================================================
+# Plot
+# ====================================================
+
+p1d <- ggplot(
+  scores,
+  aes(
+    Axis.1,
+    Axis.2,
+    colour = Category
+  )
+) +
+
+  geom_polygon(
+    data = hulls,
+    aes(
+      fill = Category,
+      group = Category
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+
+  geom_point(
+    size = 4
+  ) +
+
+
+
+  scale_colour_manual(
+    values = col.f1
+  ) +
+
+  scale_fill_manual(
+    values = col.f1
+  ) +
+
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.1,
+    vjust = 1.1,
+    label = paste0(
+      "PERMANOVA\nR² = ",
+      perm_r2,
+      "\np = ",
+      perm_p
+    ),
+    size = 4
+  ) +
+
+  labs(
+    x = paste0(
+      "PCoA1 (",
+      pc1,
+      "%)"
+    ),
+    y = paste0(
+      "PCoA2 (",
+      pc2,
+      "%)"
+    )
+  ) +
+
+  theme_bw(base_size = 12) +
+
+  theme(panel.border = element_rect(
+colour = "black",
+fill = NA,
+linewidth = 1
+),
+    legend.title = element_blank(),
+    legend.position = "right"
+  )
+
+p1d
+
+```
+
+### Fig 1E: Distance from Field community using Bray-Curtis and Weighted UniFrac
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(rstatix)
+library(tibble)
+
+# ====================================================
+# Figure 1E: Distance to Field centroid
+# ====================================================
+
+# Samples to keep
+keep_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+# Metadata
+meta <- mco$sample_table[keep_samples, , drop = FALSE] %>%
+  rownames_to_column("Sample")
+
+meta$Category <- factor(
+  meta$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  ),
+  labels = c(
+    "Field",
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# Colors
+col.f1 <- c(
+  "Field" = "#2CA25F",
+  "0 h"   = "#FEE0D2",
+  "24 h"  = "#FC9272",
+  "48 h"  = "#EF3B2C",
+  "72 h"  = "#99000D"
+)
+
+# ====================================================
+# Bray-Curtis distance to Field centroid
+# ====================================================
+
+bray <- mco$beta_diversity$bray[
+  keep_samples,
+  keep_samples
+]
+
+bray.pcoa <- cmdscale(
+  as.dist(bray),
+  k = 2
+)
+
+bray.df <- as.data.frame(bray.pcoa)
+bray.df$Sample <- rownames(bray.df)
+
+bray.df <- left_join(
+  bray.df,
+  meta,
+  by = "Sample"
+)
+
+field.centroid.bray <- colMeans(
+  bray.df[
+    bray.df$Category == "Field",
+    c("V1", "V2")
+  ]
+)
+
+bray.df$Distance <- sqrt(
+  (bray.df$V1 - field.centroid.bray[1])^2 +
+  (bray.df$V2 - field.centroid.bray[2])^2
+)
+
+# Statistics
+kw.bray <- kruskal.test(
+  Distance ~ Category,
+  data = bray.df
+)
+
+dunn.bray <- bray.df %>%
+  dunn_test(
+    Distance ~ Category,
+    p.adjust.method = "BH"
+  )
+
+# ====================================================
+# Weighted UniFrac distance to Field centroid
+# ====================================================
+
+wuni <- mco$beta_diversity$wei_unifrac[
+  keep_samples,
+  keep_samples
+]
+
+wuni.pcoa <- cmdscale(
+  as.dist(wuni),
+  k = 2
+)
+
+wuni.df <- as.data.frame(wuni.pcoa)
+wuni.df$Sample <- rownames(wuni.df)
+
+wuni.df <- left_join(
+  wuni.df,
+  meta,
+  by = "Sample"
+)
+
+field.centroid.wuni <- colMeans(
+  wuni.df[
+    wuni.df$Category == "Field",
+    c("V1", "V2")
+  ]
+)
+
+wuni.df$Distance <- sqrt(
+  (wuni.df$V1 - field.centroid.wuni[1])^2 +
+  (wuni.df$V2 - field.centroid.wuni[2])^2
+)
+
+# Statistics
+kw.wuni <- kruskal.test(
+  Distance ~ Category,
+  data = wuni.df
+)
+
+dunn.wuni <- wuni.df %>%
+  dunn_test(
+    Distance ~ Category,
+    p.adjust.method = "BH"
+  )
+
+# ====================================================
+# Summary statistics
+# ====================================================
+
+summ_fun <- function(df){
+
+  df %>%
+    group_by(Category) %>%
+    summarise(
+      Median = median(Distance),
+      Mean   = mean(Distance),
+      SD     = sd(Distance),
+      .groups = "drop"
+    )
+}
+
+bray.sum <- summ_fun(bray.df)
+wuni.sum <- summ_fun(wuni.df)
+
+# ====================================================
+# Plot function
+# ====================================================
+
+plot_dist <- function(df,
+                      sum.df,
+                      metric_name,
+                      kw.p){
+
+  ggplot() +
+
+    geom_errorbar(
+      data = sum.df,
+      aes(
+        Category,
+        ymin = Mean - SD,
+        ymax = Mean + SD,
+        colour = Category
+      ),
+      width = 0,
+      linewidth = 0.8
+    ) +
+
+    geom_line(
+      data = sum.df,
+      aes(
+        Category,
+        Median,
+        group = 1
+      ),
+      colour = "black",
+      linewidth = 0.8
+    ) +
+
+    geom_point(
+      data = sum.df,
+      aes(
+        Category,
+        Median,
+        fill = Category
+      ),
+      shape = 21,
+      size = 4,
+      colour = "black"
+    ) +
+
+    geom_point(
+      data = df,
+      aes(
+        Category,
+        Distance,
+        colour = Category
+      ),
+      size = 2.5,
+      alpha = 0.6
+    ) +
+
+    stat_pvalue_manual(
+      data.frame(
+        group1 = "Field",
+        group2 = "48 h",
+        y.position = max(df$Distance) * 1.08,
+        label = "*"
+      ),
+      label = "label",
+      tip.length = 0.01
+    ) +
+
+    scale_colour_manual(
+      values = col.f1
+    ) +
+    scale_fill_manual(
+      values = col.f1
+    ) +
+
+    labs(
+      x = NULL,
+      y = metric_name
+    ) +
+
+    annotate(
+      "text",
+      x = Inf,
+      y = Inf,
+      hjust = 1.1,
+      vjust = 20,
+      label = paste0(
+        "KW p = ",
+        signif(kw.p, 3)
+      ),
+      size = 3.5
+    ) +
+
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      ),
+
+      axis.title.y = element_text(
+        
+        size = 12
+      ),
+
+      plot.subtitle = element_text(
+        hjust = 0.5,
+        face = "italic",
+        size = 10
+      )
+    )
+}
+
+# ====================================================
+# Create panels
+# ====================================================
+
+p.bray <- plot_dist(
+  bray.df,
+  bray.sum,
+  "Bray-Curtis",
+  kw.bray$p.value
+)
+
+p.wuni <- plot_dist(
+  wuni.df,
+  wuni.sum,
+  "Weighted UniFrac",
+  kw.wuni$p.value
+)
+
+# ====================================================
+# Combine Figure 1E
+# ====================================================
+
+p1e <- (p.bray + p.wuni)
+
+p1e
+
+# ====================================================
+# Print statistics
+# ====================================================
+
+kw.bray
+dunn.bray
+
+kw.wuni
+dunn.wuni
+```
+
+## Figure 2: Inoculum conditioning introduces compound-specific biodegradation variability
+
+### Fig 2a: Heatmap
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(tibble)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# ====================================================
+# Figure 2A
+# Compound-specific biodegradation responses
+# ====================================================
+
+# Import data
+kdat <- read_excel(
+  "../MS-Spike-Timing_Supplementary-Tables.xlsx",
+  sheet = "S2 k Rates"
+)
+
+# Create matrix
+mat <- kdat %>%
+  column_to_rownames("Compound") %>%
+  as.matrix()
+
+storage.mode(mat) <- "numeric"
+
+# Keep treatment order
+mat <- mat[, c("0 h", "24 h", "48 h", "72 h")]
+
+# Negative k-values -> 0
+mat[mat < 0] <- 0
+
+# Keep only compounds with measurable biodegradation
+mat <- mat[
+  rowSums(mat > 0, na.rm = TRUE) > 0,
+]
+
+# Log-transform
+mat.hm <- log10(mat + 0.001)
+
+# Matrix for clustering
+mat.cluster <- mat.hm
+mat.cluster[is.na(mat.cluster)] <- -3
+
+# Hierarchical clustering
+hc <- hclust(
+  dist(
+    mat.cluster,
+    method = "euclidean"
+  ),
+  method = "mcquitty"
+)
+
+# ====================================================
+# Heatmap colour palette
+# ====================================================
+
+col_fun <- colorRamp2(
+  c(-3, -2, -1, 0, 1, 1.5),
+  c(
+    "gray95",
+    "#FDE0DD",
+    "#FA9FB5",
+    "#C51B8A",
+    "#7A0177",
+    "#2D004B"
+  )
+)
+
+# ====================================================
+# Conditioning annotation
+# ====================================================
+
+ha <- HeatmapAnnotation(
+  Conditioning = factor(
+    c("0 h", "24 h", "48 h", "72 h"),
+    levels = c("0 h", "24 h", "48 h", "72 h")
+  ),
+
+  col = list(
+    Conditioning = c(
+      "0 h"  = "#FEE0D2",
+      "24 h" = "#FC9272",
+      "48 h" = "#EF3B2C",
+      "72 h" = "#99000D"
+    )
+  ),
+
+  show_annotation_name = FALSE
+)
+
+# ====================================================
+# Heatmap
+# ====================================================
+
+ht <- Heatmap(
+  mat.hm,
+
+  name = "Rate constant (k)",
+
+  top_annotation = ha,
+
+  col = col_fun,
+
+  na_col = "white",
+
+  cluster_rows = as.dendrogram(hc),
+  cluster_columns = FALSE,
+
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+
+  row_dend_width = unit(25, "mm"),
+
+  heatmap_legend_param = list(
+    title = "Rate constant (k)",
+    at = c(-3, -2, -1, 0),
+    labels = c(
+      "0.001",
+      "0.01",
+      "0.1",
+      "1"
+    ),
+    direction = "horizontal",
+    title_position = "topcenter"
+  )
+)
+
+# ====================================================
+# Draw
+# ====================================================
+
+draw(
+  ht,
+  heatmap_legend_side = "top",
+  annotation_legend_side = "top"
+)
+```
+
+### Fig 2B: Top 12 positive responders to inoculum conditioning
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+
+# ====================================================
+# Figure 2B
+# Top 12 positive responders to inoculum conditioning
+# ====================================================
+
+# Import data
+kdat <- read_excel(
+  "../MS-Spike-Timing_Supplementary-Tables.xlsx",
+  sheet = "S2 k Rates"
+)
+
+# Negative k-values -> 0
+kdat[,-1] <- lapply(
+  kdat[,-1],
+  function(x) ifelse(x < 0, 0, x)
+)
+
+# Calculate response magnitude
+resp <- kdat %>%
+  mutate(
+    Delta72 = `72 h` - `0 h`
+  ) %>%
+  arrange(desc(Delta72))
+
+# Top positive responders
+top_compounds <- resp %>%
+  slice(1:12) %>%
+  pull(Compound)
+
+# Long format for plotting
+plotdat <- kdat %>%
+  filter(Compound %in% top_compounds) %>%
+  pivot_longer(
+    cols = c(`0 h`, `24 h`, `48 h`, `72 h`),
+    names_to = "Conditioning",
+    values_to = "k"
+  )
+
+# Treatment order
+plotdat$Conditioning <- factor(
+  plotdat$Conditioning,
+  levels = c("0 h", "24 h", "48 h", "72 h")
+)
+
+# Preserve ranking order
+plotdat$Compound <- factor(
+  plotdat$Compound,
+  levels = top_compounds
+)
+
+# Treatment colors
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# Plot
+ggplot(
+  plotdat,
+  aes(
+    x = Conditioning,
+    y = k,
+    group = 1
+  )
+) +
+  geom_line(
+    colour = "grey50",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    aes(fill = Conditioning),
+    shape = 21,
+    size = 3.5,
+    colour = "black",
+    stroke = 0.3
+  ) +
+  scale_fill_manual(
+    values = cond_cols
+  ) +
+  facet_wrap(
+    ~ Compound,
+    scales = "free_y",
+    ncol = 4
+  ) +
+  labs(
+    x = "Conditioning time",
+    y = expression("Rate constant (" * k * ")"),
+    fill = "Conditioning"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(
+      face = "bold",
+      size = 8
+    ),
+    axis.text = element_text(
+      colour = "black"
+    ),
+    legend.position = "none"
+  )
+
+# Selected compounds
+resp %>%
+  select(
+    Compound,
+    `0 h`,
+    `72 h`,
+    Delta72
+  ) %>%
+  slice(1:12)
+```
+
+### Figure S2: Maximum conditioning response - Δkmax = max(k24, k48, k72) - k0
+
+```{r}
+library(readxl); library(tidyverse); library(ggplot2); library(ggbreak)
+
+# Import data
+kdat <- read_excel("../MS-Spike-Timing_Supplementary-Tables.xlsx", sheet = "S2 k Rates")
+
+# Negative k-values -> 0; Missing values -> 0
+kdat[,-1] <- lapply(kdat[,-1], function(x) ifelse(x < 0, 0, x)); kdat[is.na(kdat)] <- 0
+
+# Calculate maximum conditioning response and preserve ranking order
+resp <- kdat %>% mutate(kmax = pmax(`24 h`, `48 h`, `72 h`, na.rm = TRUE), DeltaMax = kmax - `0 h`) %>% arrange(DeltaMax)
+resp$Compound <- factor(resp$Compound, levels = resp$Compound)
+
+# Plot
+ggplot(resp, aes(x = Compound, y = DeltaMax, fill = DeltaMax > 0)) + geom_col(width = 0.85) +
+geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.7) +
+scale_fill_manual(values = c("TRUE"  = "#7A0177", "FALSE" = "grey70"), guide = "none") +
+scale_y_break(c(0.8, 3.1)) + scale_y_break(c(-0.5, -1)) +
+labs(x = NULL, y = expression(Delta * k[max])) + theme_classic(base_size = 10) +
+theme(axis.title.x = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(colour = "black"), axis.title.y = element_text(face = "bold"))
+```
+
+### Figure 2C: Top positive and negative responders
+
+```{r}
+# Top positive and negative responders
+
+plotdat <- bind_rows(
+  resp %>% arrange(desc(DeltaMax)) %>% slice(1:10),
+  resp %>% arrange(DeltaMax) %>% slice(1:5)
+) %>%
+  distinct(Compound, .keep_all = TRUE)
+
+plotdat$Compound <- factor(
+  plotdat$Compound,
+  levels = plotdat$Compound[order(plotdat$DeltaMax)]
+)
+
+ggplot(
+  plotdat,
+  aes(
+    x = Compound,
+    y = DeltaMax,
+    color = DeltaMax > 0
+  )
+) +
+  geom_segment(
+    aes(
+      x = Compound,
+      xend = Compound,
+      y = 0,
+      yend = DeltaMax
+    ),
+    linewidth = 0.5
+  ) +
+  geom_point(
+    size = 2
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "TRUE" = "#7A0177",
+      "FALSE" = "grey60"
+    ),
+    guide = "none"
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = expression(Delta * k[max])
+  ) +
+  theme_classic(base_size = 12)
+```
+
+### Figure 2D: Response landscape
+
+```{r}
+### Choosing threshold parameter
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+
+# Import data
+kdat <- read_excel(
+  "../MS-Spike-Timing_Supplementary-Tables.xlsx",
+  sheet = "S2 k Rates"
+)
+
+# Replace negative and missing values with 0
+kdat[,-1] <- lapply(
+  kdat[,-1],
+  function(x) ifelse(x < 0, 0, x)
+)
+
+kdat[is.na(kdat)] <- 0
+
+# Calculate Delta kmax
+resp <- kdat %>%
+  mutate(
+    kmax = pmax(`24 h`, `48 h`, `72 h`, na.rm = TRUE),
+    DeltaMax = kmax - `0 h`
+  )
+
+# --------------------------------------------------
+# Distribution plot
+# --------------------------------------------------
+
+ggplot(resp, aes(x = DeltaMax)) +
+  geom_histogram(
+    bins = 20,
+    fill = "grey70",
+    color = "black"
+  ) +
+  geom_vline(
+    xintercept = c(-0.02, 0.02),
+    linetype = "dashed",
+    color = "red",
+    linewidth = 1
+  ) +
+  theme_classic() +
+  labs(
+    x = expression(Delta*k[max]),
+    y = "Number of compounds",
+    title = "Distribution of maximum conditioning responses"
+  )
+
+# --------------------------------------------------
+# Quantiles
+# --------------------------------------------------
+
+cat("\nQuantiles of |Delta kmax|:\n")
+
+print(
+  quantile(
+    abs(resp$DeltaMax),
+    probs = c(0.25, 0.50, 0.75, 0.90, 0.95),
+    na.rm = TRUE
+  )
+)
+
+# --------------------------------------------------
+# Sensitivity analysis
+# --------------------------------------------------
+
+thresholds <- c(0.01, 0.02, 0.03, 0.05, 0.10)
+
+results <- lapply(thresholds, function(thr){
+
+  tmp <- resp %>%
+    mutate(
+      Response = case_when(
+        `0 h` == 0 & kmax > 0      ~ "Emergent",
+        `0 h` > 0 & DeltaMax > thr ~ "Enhanced",
+        DeltaMax < -thr            ~ "Reduced",
+        TRUE                       ~ "No substantial response"
+      )
+    )
+
+  out <- table(tmp$Response)
+
+  data.frame(
+    Threshold = thr,
+    Category = names(out),
+    Count = as.numeric(out)
+  )
+})
+
+results <- bind_rows(results)
+
+print(results)
+
+# --------------------------------------------------
+# Plot threshold sensitivity
+# --------------------------------------------------
+
+ggplot(
+  results,
+  aes(
+    x = factor(Threshold),
+    y = Count,
+    fill = Category
+  )
+) +
+  geom_col(position = "stack") +
+  theme_classic() +
+  labs(
+    x = "Threshold",
+    y = "Number of compounds"
+  )
+```
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+
+# ====================================================
+# Figure 2D
+# Response landscape
+# ====================================================
+
+kdat <- read_excel(
+  "../MS-Spike-Timing_Supplementary-Tables.xlsx",
+  sheet = "S2 k Rates"
+)
+
+# Negative values -> 0
+kdat[,-1] <- lapply(
+  kdat[,-1],
+  function(x) ifelse(x < 0, 0, x)
+)
+
+# Missing values -> 0
+kdat[is.na(kdat)] <- 0
+
+# Maximum response
+resp <- kdat %>%
+  mutate(
+    kmax = pmax(
+      `24 h`,
+      `48 h`,
+      `72 h`,
+      na.rm = TRUE
+    ),
+    DeltaMax = kmax - `0 h`
+  )
+
+# Response categories
+thr <- 0.02
+
+resp <- resp %>%
+  mutate(
+    Response = case_when(
+      `0 h` == 0 & kmax > 0          ~ "Emergent",
+      `0 h` > 0 & DeltaMax > thr     ~ "Enhanced",
+      DeltaMax < -thr               ~ "Reduced",
+      TRUE                          ~ "No substantial response"
+    )
+  )
+
+plotdat <- resp %>%
+  count(Response) %>%
+  mutate(
+    pct = n / sum(n),
+    label = paste0(
+      Response,
+      "\n",
+      round(100 * pct, 0),
+      "%"
+    )
+  )
+
+ggplot(
+  plotdat,
+  aes(
+    x = 2,
+    y = n,
+    fill = Response
+  )
+) +
+  geom_col(
+    width = 1,
+    color = "white",
+    linewidth = 0.5
+  ) +
+  coord_polar(theta = "y") +
+  xlim(0.5, 2.5) +
+  geom_text(
+    aes(label = paste0(round(100*pct), "%")),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Emergent" = "#49006A",
+      "Enhanced" = "#C51B8A",
+      "No substantial response" = "#D9D9D9",
+      "Reduced" = "grey60"
+    )
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "right"
+  )
+```
+
+### Figure 2E: Optimal conditioning duration
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+
+# ====================================================
+# Figure 2D
+# Optimal conditioning duration
+# ====================================================
+
+kdat <- read_excel(
+  "../MS-Spike-Timing_Supplementary-Tables.xlsx",
+  sheet = "S2 k Rates"
+)
+
+# Negative values -> 0
+kdat[,-1] <- lapply(
+  kdat[,-1],
+  function(x) ifelse(x < 0, 0, x)
+)
+
+# Missing values -> 0
+kdat[is.na(kdat)] <- 0
+
+# Determine conditioning duration producing maximum k
+plotdat <- kdat %>%
+  rowwise() %>%
+  mutate(
+    kmax = max(
+      c(`24 h`, `48 h`, `72 h`)
+    ),
+    
+    Optimum = case_when(
+      kmax == 0 ~ "No measurable response",
+      `72 h` == kmax ~ "72 h",
+      `48 h` == kmax ~ "48 h",
+      `24 h` == kmax ~ "24 h"
+    )
+  ) %>%
+  ungroup() %>%
+  count(Optimum) %>%
+  mutate(
+    pct = n / sum(n),
+    label = paste0(
+      Optimum,
+      "\n",
+      round(100 * pct),
+      "%"
+    )
+  )
+
+ggplot(
+  plotdat,
+  aes(
+    x = 2,
+    y = n,
+    fill = Optimum
+  )
+) +
+  geom_col(
+    width = 1,
+    color = "white",
+    linewidth = 0.5
+  ) +
+  coord_polar(
+    theta = "y"
+  ) +
+  xlim(0.5, 2.5) +
+  geom_text(
+    aes(
+      label = paste0(round(pct * 100), "%")
+    ),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "24 h" = "#FEE0D2",
+      "48 h" = "#EF3B2C",
+      "72 h" = "#99000D",
+      "No measurable response" = "grey75"
+    )
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "right"
+  )
+```
+
+## Figure 3: Inoculum state changed through selective turnover of microbial populations. 
+
+### Figure 3A-B: Retention of field taxa - Genus-level retention
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(tibble)
+
+# ====================================================
+# Figure 3A
+# Retention of field taxa (presence/absence)
+# Genus-level retention
+# ====================================================
+
+# Genus abundance table
+genus_tab <- mco$taxa_abund$Genus
+
+# ----------------------------------------------------
+# Samples
+# ----------------------------------------------------
+
+field_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category == "Field"
+  )
+)
+
+cond_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category %in% c(
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+# ----------------------------------------------------
+# Define field genus pool
+# ----------------------------------------------------
+
+field_taxa <- genus_tab %>%
+  rownames_to_column("Genus") %>%
+  filter(
+    rowSums(
+      select(., all_of(field_samples))
+    ) > 0
+  ) %>%
+  pull(Genus)
+
+n_field <- length(field_taxa)
+
+# ----------------------------------------------------
+# Calculate retention for each replicate
+# ----------------------------------------------------
+
+retention <- purrr::map_dfr(
+  cond_samples,
+  function(s){
+
+    sample_taxa <- genus_tab %>%
+      rownames_to_column("Genus") %>%
+      filter(
+        .data[[s]] > 0
+      ) %>%
+      pull(Genus)
+
+    tibble(
+      Sample = s,
+      Retention =
+        length(
+          intersect(field_taxa, sample_taxa)
+        ) /
+        n_field * 100
+    )
+  }
+)
+
+# ----------------------------------------------------
+# Add metadata
+# ----------------------------------------------------
+
+retention <- retention %>%
+  left_join(
+    mco$sample_table %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  )
+
+retention$Category <- factor(
+  retention$Category,
+  levels = c(
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  ),
+  labels = c(
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# ----------------------------------------------------
+# Summary statistics
+# ----------------------------------------------------
+
+ret.sum <- retention %>%
+  group_by(Category) %>%
+  summarise(
+    Median = median(Retention),
+    Q1 = quantile(Retention, 0.25),
+    Q3 = quantile(Retention, 0.75),
+    .groups = "drop"
+  )
+
+# ----------------------------------------------------
+# Kruskal-Wallis test
+# ----------------------------------------------------
+
+kw.ret <- kruskal.test(
+  Retention ~ Category,
+  data = retention
+)
+
+# ----------------------------------------------------
+# Colors
+# ----------------------------------------------------
+
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# ----------------------------------------------------
+# Plot
+# ----------------------------------------------------
+
+p3a <- ggplot() +
+
+  geom_errorbar(
+    data = ret.sum,
+    aes(
+      x = Category,
+      ymin = Q1,
+      ymax = Q3,
+      colour = Category
+    ),
+    width = 0,
+    linewidth = 1
+  ) +
+
+  geom_line(
+    data = ret.sum,
+    aes(
+      x = Category,
+      y = Median,
+      group = 1
+    ),
+    colour = "black",
+    linewidth = 0.8
+  ) +
+
+  geom_point(
+    data = ret.sum,
+    aes(
+      x = Category,
+      y = Median,
+      fill = Category
+    ),
+    shape = 21,
+    size = 5,
+    colour = "black",
+    stroke = 0.8
+  ) +
+
+  geom_point(
+    data = retention,
+    aes(
+      x = Category,
+      y = Retention,
+      colour = Category
+    ),
+    alpha = 0.5,
+    size = 3
+  ) +
+
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.05,
+    vjust = 1,
+    label = paste0(
+      "KW p = ",
+      signif(kw.ret$p.value, 3)
+    ),
+    size = 4
+  ) +
+
+  scale_colour_manual(
+    values = cond_cols
+  ) +
+
+  scale_fill_manual(
+    values = cond_cols
+  ) +
+
+  labs(
+    x = "Conditioning time",
+    y = "Field taxon retention (%)"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    legend.position = "none",
+    axis.text = element_text(
+      colour = "black"
+    )
+  )
+
+p3a
+
+library(tidyverse)
+library(ggplot2)
+library(tibble)
+
+# ====================================================
+# Figure 3B
+# Abundance-weighted retention of field community
+# ====================================================
+
+# Genus abundance table
+genus_tab <- mco$taxa_abund$Genus
+
+# ----------------------------------------------------
+# Samples
+# ----------------------------------------------------
+
+field_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category == "Field"
+  )
+)
+
+cond_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category %in% c(
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+# ----------------------------------------------------
+# Mean field composition
+# ----------------------------------------------------
+
+field_rel <- genus_tab[, field_samples]
+
+field_rel <- sweep(
+  field_rel,
+  2,
+  colSums(field_rel),
+  "/"
+)
+
+field_mean <- rowMeans(
+  field_rel,
+  na.rm = TRUE
+)
+
+# ----------------------------------------------------
+# Calculate abundance-weighted retention
+# ----------------------------------------------------
+
+retention <- purrr::map_dfr(
+  cond_samples,
+  function(s){
+
+    sample_rel <- genus_tab[, s]
+
+    sample_rel <- sample_rel / sum(sample_rel)
+
+    overlap <- sum(
+      pmin(
+        field_mean,
+        sample_rel
+      )
+    )
+
+    tibble(
+      Sample = s,
+      Retention = overlap * 100
+    )
+  }
+)
+
+# ----------------------------------------------------
+# Add metadata
+# ----------------------------------------------------
+
+retention <- retention %>%
+  left_join(
+    mco$sample_table %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  )
+
+retention$Category <- factor(
+  retention$Category,
+  levels = c(
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  ),
+  labels = c(
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# ----------------------------------------------------
+# Summary statistics
+# ----------------------------------------------------
+
+ret.sum <- retention %>%
+  group_by(Category) %>%
+  summarise(
+    Median = median(Retention),
+    Q1 = quantile(Retention, 0.25),
+    Q3 = quantile(Retention, 0.75),
+    .groups = "drop"
+  )
+
+# ----------------------------------------------------
+# Statistics
+# ----------------------------------------------------
+
+kw.ret <- kruskal.test(
+  Retention ~ Category,
+  data = retention
+)
+
+# ----------------------------------------------------
+# Colors
+# ----------------------------------------------------
+
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# ----------------------------------------------------
+# Plot
+# ----------------------------------------------------
+
+p3b <- ggplot() +
+
+  geom_errorbar(
+    data = ret.sum,
+    aes(
+      x = Category,
+      ymin = Q1,
+      ymax = Q3,
+      colour = Category
+    ),
+    width = 0,
+    linewidth = 1
+  ) +
+
+  geom_line(
+    data = ret.sum,
+    aes(
+      x = Category,
+      y = Median,
+      group = 1
+    ),
+    colour = "black",
+    linewidth = 0.8
+  ) +
+
+  geom_point(
+    data = ret.sum,
+    aes(
+      x = Category,
+      y = Median,
+      fill = Category
+    ),
+    shape = 21,
+    size = 5,
+    colour = "black"
+  ) +
+
+  geom_point(
+    data = retention,
+    aes(
+      x = Category,
+      y = Retention,
+      colour = Category
+    ),
+    alpha = 0.5,
+    size = 3
+  ) +
+
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.05,
+    vjust = 1,
+    label = paste0(
+      "KW p = ",
+      signif(kw.ret$p.value, 3)
+    ),
+    size = 4
+  ) +
+
+  scale_colour_manual(
+    values = cond_cols
+  ) +
+
+  scale_fill_manual(
+    values = cond_cols
+  ) +
+
+  labs(
+    x = "Conditioning time",
+    y = "Abundance-weighted retention (%)"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    legend.position = "none",
+    axis.text = element_text(
+      colour = "black"
+    )
+  )
+
+p3b
+
+library(patchwork)
+
+p3ab <- p3a + p3b +
+  plot_layout(ncol = 2)
+
+p3ab
+```
+
+### Figure 3C: Taxonomic turnover during conditioning
+
+```{r}
+library(tidyverse)
+library(tibble)
+library(ggplot2)
+
+# ====================================================
+# Figure 3C
+# Taxonomic turnover during conditioning
+# ====================================================
+
+genus_tab <- mco$taxa_abund$Genus
+
+# ----------------------------------------------------
+# Field genus pool
+# ----------------------------------------------------
+
+field_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category == "Field"
+  )
+)
+
+field_taxa <- genus_tab %>%
+  rownames_to_column("Genus") %>%
+  filter(
+    rowSums(
+      select(., all_of(field_samples))
+    ) > 0
+  ) %>%
+  pull(Genus)
+
+# ----------------------------------------------------
+# Turnover function
+# ----------------------------------------------------
+
+calc_turnover <- function(category){
+
+  samps <- rownames(
+    subset(
+      mco$sample_table,
+      Category == category
+    )
+  )
+
+  taxa_present <- genus_tab %>%
+    rownames_to_column("Genus") %>%
+    filter(
+      rowSums(
+        select(., all_of(samps))
+      ) > 0
+    ) %>%
+    pull(Genus)
+
+  retained <- length(
+    intersect(field_taxa, taxa_present)
+  )
+
+  lost <- length(
+    setdiff(field_taxa, taxa_present)
+  )
+
+  gained <- length(
+    setdiff(taxa_present, field_taxa)
+  )
+
+  tibble(
+    Category = category,
+    Retained = retained,
+    Lost = lost,
+    Gained = gained
+  )
+}
+
+# ----------------------------------------------------
+# Assemble data
+# ----------------------------------------------------
+
+plotdat <- bind_rows(
+
+  tibble(
+    Category = "Field",
+    Retained = length(field_taxa),
+    Lost = 0,
+    Gained = 0
+  ),
+
+  calc_turnover("Spike - 0 h"),
+  calc_turnover("Spike - 24 h"),
+  calc_turnover("Spike - 48 h"),
+  calc_turnover("Spike - 72 h")
+)
+
+plotdat$Category <- factor(
+  plotdat$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  ),
+  labels = c(
+    "Field",
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# ----------------------------------------------------
+# Total genera per treatment
+# ----------------------------------------------------
+
+plotdat <- plotdat %>%
+  mutate(
+    Total = Retained + Lost + Gained
+  )
+
+max_total <- max(plotdat$Total)
+
+# ----------------------------------------------------
+# Long format
+# ----------------------------------------------------
+
+bars <- plotdat %>%
+  select(
+    Category,
+    Retained,
+    Lost,
+    Gained
+  ) %>%
+  pivot_longer(
+    cols = c(
+      Retained,
+      Lost,
+      Gained
+    ),
+    names_to = "Status",
+    values_to = "Count"
+  )
+
+bars$Status <- factor(
+  bars$Status,
+  levels = c(
+    "Gained",
+    "Lost",
+    "Retained"
+  )
+)
+
+# ----------------------------------------------------
+# Plot
+# ----------------------------------------------------
+
+p3c <- ggplot(
+  bars,
+  aes(
+    x = Category,
+    y = Count,
+    fill = Status
+  )
+) +
+
+  geom_col(
+    width = 0.8
+  ) +
+
+  geom_text(
+    data = plotdat,
+    aes(
+      x = Category,
+      y = Total + max_total * 0.05,
+      label = Total
+    ),
+    inherit.aes = FALSE,
+    size = 4
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "Retained" = "#B7E4C7",
+      "Lost"     = "#CFCFCF",
+      "Gained"   = "#F2CF1D"
+    )
+  ) +
+
+  coord_cartesian(
+    ylim = c(
+      0,
+      max_total * 1.08
+    )
+  ) +
+
+  labs(
+    x = "Conditioning time",
+    y = "Number of genera",
+    fill = NULL
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    axis.text = element_text(
+      colour = "black"
+    ),
+    legend.position = "top",
+    legend.title = element_blank()
+  )
+
+p3c
+```
+
+### Figure 3D: Indicator genera heatmap
+
+```{r}
+library(phyloseq)
+library(file2meco)
+library(indicspecies)
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+library(vegan)
+library(grid)
+
+# =====================================================
+# Figure 3D
+# Indicator genera heatmap
+# =====================================================
+
+# -----------------------------------------------------
+# Convert mco -> phyloseq
+# -----------------------------------------------------
+
+ps <- meco2phyloseq(mco)
+
+# -----------------------------------------------------
+# Keep samples
+# -----------------------------------------------------
+
+keep <- sample_names(ps)[
+  sample_data(ps)$Category %in% c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+]
+
+ps <- prune_samples(keep, ps)
+
+# -----------------------------------------------------
+# Aggregate to genus
+# -----------------------------------------------------
+
+ps.gen <- tax_glom(
+  ps,
+  taxrank = "Genus",
+  NArm = FALSE
+)
+
+# -----------------------------------------------------
+# OTU table
+# -----------------------------------------------------
+
+otu <- as.data.frame(
+  otu_table(ps.gen)
+)
+
+if(!taxa_are_rows(ps.gen)){
+  otu <- t(otu)
+}
+
+otu <- as.data.frame(otu)
+
+# -----------------------------------------------------
+# Genus labels
+# -----------------------------------------------------
+
+tax <- as.data.frame(
+  tax_table(ps.gen)
+)
+
+tax$Genus <- as.character(tax$Genus)
+
+tax$Genus <- gsub(
+  "^g__",
+  "",
+  tax$Genus
+)
+
+tax$Genus[
+  is.na(tax$Genus) |
+  tax$Genus == ""
+] <- "Unclassified"
+
+rownames(otu) <- make.unique(
+  tax$Genus
+)
+
+# -----------------------------------------------------
+# Metadata
+# -----------------------------------------------------
+
+meta <- as.data.frame(
+  sample_data(ps.gen)
+)
+
+group <- factor(
+  meta$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+)
+
+# -----------------------------------------------------
+# Indicator species analysis
+# -----------------------------------------------------
+
+ind <- multipatt(
+  t(otu),
+  group,
+  func = "IndVal.g",
+  control = how(nperm = 999)
+)
+
+# -----------------------------------------------------
+# Significant indicator taxa
+# -----------------------------------------------------
+
+ind.tbl <- ind$sign %>%
+  as.data.frame() %>%
+  rownames_to_column("Genus") %>%
+  filter(
+    p.value < 0.05
+  )
+
+# -----------------------------------------------------
+# Determine indicator group
+# -----------------------------------------------------
+
+grp.cols <- grep(
+  "^s\\.",
+  names(ind.tbl),
+  value = TRUE
+)
+
+ind.tbl$IndicatorGroup <- grp.cols[
+  apply(
+    ind.tbl[, grp.cols],
+    1,
+    which.max
+  )
+]
+
+ind.tbl$IndicatorGroup <- gsub(
+  "^s\\.",
+  "",
+  ind.tbl$IndicatorGroup
+)
+
+ind.tbl$IndicatorGroup <- gsub(
+  "Spike - ",
+  "",
+  ind.tbl$IndicatorGroup
+)
+
+# -----------------------------------------------------
+# Top indicators per treatment
+# -----------------------------------------------------
+
+top_taxa <- ind.tbl %>%
+  arrange(
+    IndicatorGroup,
+    desc(stat)
+  ) %>%
+  group_by(
+    IndicatorGroup
+  ) %>%
+  slice_head(
+    n = 4
+  ) %>%
+  ungroup()
+
+tax.keep <- top_taxa$Genus
+
+# -----------------------------------------------------
+# Mean abundance by treatment
+# -----------------------------------------------------
+
+mat <- sapply(
+  levels(group),
+  function(g){
+
+    samps <- rownames(
+      meta[group == g, , drop = FALSE]
+    )
+
+    rowMeans(
+      otu[
+        tax.keep,
+        samps,
+        drop = FALSE
+      ],
+      na.rm = TRUE
+    )
+  }
+)
+
+rownames(mat) <- tax.keep
+
+# -----------------------------------------------------
+# Log transform
+# -----------------------------------------------------
+
+mat <- log10(
+  mat + 0.001
+)
+
+# -----------------------------------------------------
+# Row-wise z score
+# -----------------------------------------------------
+
+mat <- t(
+  scale(
+    t(mat)
+  )
+)
+
+mat[is.na(mat)] <- 0
+
+# -----------------------------------------------------
+# Nice column names
+# -----------------------------------------------------
+
+colnames(mat) <- c(
+  "Field",
+  "0 h",
+  "24 h",
+  "48 h",
+  "72 h"
+)
+
+# -----------------------------------------------------
+# Row metadata
+# -----------------------------------------------------
+
+row.info <- top_taxa[
+  match(
+    rownames(mat),
+    top_taxa$Genus
+  ),
+]
+
+# -----------------------------------------------------
+# Column annotation
+# -----------------------------------------------------
+
+ha <- HeatmapAnnotation(
+
+  Conditioning = factor(
+    colnames(mat),
+    levels = c(
+      "Field",
+      "0 h",
+      "24 h",
+      "48 h",
+      "72 h"
+    )
+  ),
+
+  col = list(
+    Conditioning = c(
+      "Field" = "#2CA25F",
+      "0 h"   = "#FEE0D2",
+      "24 h"  = "#FC9272",
+      "48 h"  = "#EF3B2C",
+      "72 h"  = "#99000D"
+    )
+  ),
+
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(8, "mm")
+)
+
+# -----------------------------------------------------
+# Row annotation
+# -----------------------------------------------------
+
+row_ha <- rowAnnotation(
+
+  Indicator = row.info$IndicatorGroup,
+
+  col = list(
+    Indicator = c(
+      "Field" = "#2CA25F",
+      "0 h"   = "#FEE0D2",
+      "24 h"  = "#FC9272",
+      "48 h"  = "#EF3B2C",
+      "72 h"  = "#99000D"
+    )
+  ),
+
+  width = unit(4, "mm"),
+
+  annotation_name_gp = gpar(
+    fontsize = 10,
+    fontface = "bold"
+  )
+)
+
+# -----------------------------------------------------
+# Color palette
+# -----------------------------------------------------
+
+col_fun <- colorRamp2(
+  c(-1.5, 0, 1.5),
+  c(
+    "#2166AC",
+    "white",
+    "#B2182B"
+  )
+)
+
+# -----------------------------------------------------
+# Heatmap
+# -----------------------------------------------------
+
+ht <- Heatmap(
+  mat,
+
+  name = "z-score",
+
+  col = col_fun,
+
+  top_annotation = ha,
+
+  left_annotation = row_ha,
+
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+
+  row_dend_width = unit(15, "mm"),
+
+  row_names_side = "right",
+  
+  row_names_gp = gpar(
+  fontsize = 10,
+  fontface = "italic"
+),
+
+  column_names_gp = gpar(
+    fontsize = 11,
+    fontface = "bold"
+  ),
+
+  border = FALSE,
+
+  heatmap_legend_param = list(
+    title = "z-score",
+    at = c(-1.5, 0, 1.5)
+  )
+)
+
+# -----------------------------------------------------
+# Draw
+# -----------------------------------------------------
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = TRUE
+)
+```
+
+### Figure 3E: Differential abundance using ANCOM-BC2
+
+```{r}
+library(ANCOMBC)
+
+ancom.out <- ancombc2(
+  data = ps.gen,
+  tax_level = "Genus",
+  fix_formula = "Category",
+  group = "Category",
+  p_adj_method = "BH",
+  prv_cut = 0.10,
+  lib_cut = 1000,
+  alpha = 0.05,
+  global = TRUE
+)
+
+names(ancom.out$res)
+
+str(ancom.out$res, max.level = 1)
+
+
+# -----------------------------------------------------
+# Extract ANCOM-BC2 results
+# -----------------------------------------------------
+
+res <- ancom.out$res
+
+lfc_cols <- grep(
+  "^lfc_CategorySpike",
+  names(res),
+  value = TRUE
+)
+
+q_cols <- grep(
+  "^q_CategorySpike",
+  names(res),
+  value = TRUE
+)
+
+# -----------------------------------------------------
+# Build volcano dataframe
+# -----------------------------------------------------
+
+plotdat <- purrr::map_dfr(
+  seq_len(nrow(res)),
+  function(i){
+
+    this_lfc <- as.numeric(
+      res[i, lfc_cols]
+    )
+
+    this_q <- as.numeric(
+      res[i, q_cols]
+    )
+
+    best <- which.max(
+      abs(this_lfc)
+    )
+
+    tibble(
+      Genus = res$taxon[i],
+      Condition = gsub(
+        "^lfc_CategorySpike - ",
+        "",
+        lfc_cols[best]
+      ),
+      logFC = this_lfc[best],
+      q = this_q[best]
+    )
+  }
+)
+
+# -----------------------------------------------------
+# Clean names
+# -----------------------------------------------------
+
+plotdat$Genus <- gsub(
+  "^g__",
+  "",
+  plotdat$Genus
+)
+
+plotdat$Genus[
+  is.na(plotdat$Genus) |
+  plotdat$Genus == ""
+] <- "Unclassified"
+
+# -----------------------------------------------------
+# Volcano coordinates
+# -----------------------------------------------------
+
+plotdat <- plotdat %>%
+  filter(
+    !is.na(q)
+  ) %>%
+  mutate(
+    neglog10q = -log10(q),
+    Significant = q < 0.05
+  )
+
+# -----------------------------------------------------
+# Labels
+# --------------------------------
+
+
+
+# -----------------------------------------------------
+# Volcano coordinates
+# -----------------------------------------------------
+
+plotdat <- plotdat %>%
+  mutate(
+    neglog10q = -log10(q),
+    Significant = q < 0.05
+  )
+
+# -----------------------------------------------------
+# Label strongest genera
+# -----------------------------------------------------
+
+label_dat <- plotdat %>%
+  filter(
+    q < 0.01
+  ) %>%
+  arrange(q) %>%
+  slice_head(
+    n = 15
+  )
+
+# -----------------------------------------------------
+# Colors
+# -----------------------------------------------------
+
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# -----------------------------------------------------
+# Figure 3E
+# -----------------------------------------------------
+
+p3e <- ggplot(
+  plotdat,
+  aes(
+    x = logFC,
+    y = neglog10q
+  )
+) +
+
+  # significance threshold
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = 2,
+    colour = "grey50"
+  ) +
+
+  # fold-change thresholds
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = 3,
+    colour = "grey60"
+  ) +
+
+  # zero line
+  geom_vline(
+    xintercept = 0,
+    linetype = 2,
+    colour = "grey50"
+  ) +
+
+  # non-significant genera
+geom_point(
+  data = subset(
+    plotdat,
+    Significant == FALSE
+  ),
+  shape = 21,
+  size = 2.8,
+  fill = "grey80",
+  colour = "grey60",
+  alpha = 0.4,
+  stroke = 0.25
+) +
+
+  # significant genera
+  geom_point(
+    data = subset(
+      plotdat,
+      Significant == TRUE
+    ),
+    aes(
+      fill = Condition
+    ),
+    shape = 21,
+    size = 3.8,
+    colour = "black",
+    stroke = 0.5
+  ) +
+
+  # taxon labels
+  geom_text_repel(
+    data = label_dat,
+    aes(
+      label = Genus
+    ),
+    size = 3,
+    fontface = "italic",
+    max.overlaps = Inf,
+    segment.alpha = 0.5,
+    seed = 123
+  ) +
+
+  scale_fill_manual(
+    values = cond_cols
+  ) +
+
+  labs(
+    x = expression(Log[2]~fold~change),
+    y = expression(-Log[10]~q),
+    fill = "Condition"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    legend.position = "right",
+
+    legend.title = element_text(
+      face = "bold"
+    ),
+
+    axis.text = element_text(
+      colour = "black"
+    )
+  )
+
+p3e
+```
+
+### Figure 3F: Spike -> Harvest community trajectories
+
+```{r}
+library(vegan)
+library(ape)
+library(tidyverse)
+library(ggplot2)
+library(grid)
+
+# ====================================================
+# Figure 3F
+# Spike -> Harvest community trajectories
+# ====================================================
+
+# ----------------------------------------------------
+# Genus abundance table
+# ----------------------------------------------------
+
+otu <- mco$taxa_abund$Genus
+
+# samples as rows
+otu <- t(otu)
+
+# ----------------------------------------------------
+# Metadata
+# ----------------------------------------------------
+
+meta <- mco$sample_table %>%
+  rownames_to_column("Sample")
+
+keep_cat <- c(
+  "Spike - 0 h",
+  "Harvest - 0 h",
+  "Spike - 24 h",
+  "Harvest - 24 h",
+  "Spike - 48 h",
+  "Harvest - 48 h",
+  "Spike - 72 h",
+  "Harvest - 72 h"
+)
+
+meta <- meta %>%
+  filter(Category %in% keep_cat)
+
+otu <- otu[
+  meta$Sample,
+  ,
+  drop = FALSE
+]
+
+# ----------------------------------------------------
+# Bray-Curtis PCoA
+# ----------------------------------------------------
+
+bc <- vegdist(
+  otu,
+  method = "bray"
+)
+
+pcoa <- ape::pcoa(bc)
+
+scores <- data.frame(
+  PCoA1 = pcoa$vectors[,1],
+  PCoA2 = pcoa$vectors[,2]
+)
+
+scores$Sample <- rownames(scores)
+
+scores <- left_join(
+  scores,
+  meta,
+  by = "Sample"
+)
+
+# ----------------------------------------------------
+# Extract conditioning time and stage
+# ----------------------------------------------------
+
+scores <- scores %>%
+  mutate(
+    Time = gsub(
+      ".*- ",
+      "",
+      Category
+    ),
+    Stage = ifelse(
+      grepl("^Spike", Category),
+      "Spike",
+      "Harvest"
+    )
+  )
+
+scores$Time <- factor(
+  scores$Time,
+  levels = c(
+    "0 h",
+    "24 h",
+    "48 h",
+    "72 h"
+  )
+)
+
+# ----------------------------------------------------
+# Centroids
+# ----------------------------------------------------
+
+traj <- scores %>%
+  group_by(
+    Time,
+    Stage
+  ) %>%
+  summarise(
+    PCoA1 = mean(PCoA1),
+    PCoA2 = mean(PCoA2),
+    .groups = "drop"
+  )
+
+# ----------------------------------------------------
+# Arrow table
+# ----------------------------------------------------
+
+arrows <- traj %>%
+  pivot_wider(
+    names_from = Stage,
+    values_from = c(
+      PCoA1,
+      PCoA2
+    )
+  )
+
+# ----------------------------------------------------
+# Variance explained
+# ----------------------------------------------------
+
+pc1 <- round(
+  pcoa$values$Relative_eig[1] * 100,
+  1
+)
+
+pc2 <- round(
+  pcoa$values$Relative_eig[2] * 100,
+  1
+)
+
+# ----------------------------------------------------
+# Conditioning colors
+# ----------------------------------------------------
+
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# ----------------------------------------------------
+# Plot
+# ----------------------------------------------------
+
+p3f <- ggplot() +
+
+  geom_segment(
+    data = arrows,
+    aes(
+      x = PCoA1_Spike,
+      y = PCoA2_Spike,
+      xend = PCoA1_Harvest,
+      yend = PCoA2_Harvest,
+      colour = Time
+    ),
+    linewidth = 1.2,
+    arrow = arrow(
+      length = unit(0.18, "cm")
+    )
+  ) +
+
+  geom_point(
+    data = scores,
+    aes(
+      PCoA1,
+      PCoA2,
+      fill = Time,
+      shape = Stage
+    ),
+    size = 4.5,
+    colour = "black",
+    stroke = 0.8
+  ) +
+
+  scale_fill_manual(
+    name = "Conditioning",
+    values = cond_cols
+  ) +
+
+  scale_colour_manual(
+    values = cond_cols,
+    guide = "none"
+  ) +
+
+  scale_shape_manual(
+    name = NULL,
+    values = c(
+      Spike = 21,
+      Harvest = 24
+    )
+  ) +
+
+  labs(
+    x = paste0(
+      "PCoA1 (",
+      pc1,
+      "%)"
+    ),
+    y = paste0(
+      "PCoA2 (",
+      pc2,
+      "%)"
+    )
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    axis.text = element_text(
+      colour = "black"
+    ),
+    legend.position = "left",
+    legend.title = element_text(
+      face = "bold"
+    )
+  )
+
+p3f
+```
+
+## Figure 4: Community structure and biodegradation function are weakly coupled
+
+### Figure S3: Procrustes analysis - Microbial composition vs biodegradation profiles
+
+```{r}
+library(tidyverse)
+library(vegan)
+library(ggplot2)
+
+# ====================================================
+# Figure 4A
+# Procrustes analysis:
+# Microbial composition vs biodegradation profiles
+# ====================================================
+
+# ----------------------------------------------------
+# Microbial centroids (Spike communities)
+# ----------------------------------------------------
+
+otu <- mco$taxa_abund$Genus
+
+meta <- mco$sample_table %>%
+  rownames_to_column("Sample")
+
+spike_meta <- meta %>%
+  filter(
+    Category %in% c(
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+
+otu_spike <- otu[
+  ,
+  spike_meta$Sample,
+  drop = FALSE
+]
+
+otu_spike <- t(otu_spike)
+
+otu_spike <- as.data.frame(otu_spike)
+
+otu_spike$Condition <- gsub(
+  "Spike - ",
+  "",
+  spike_meta$Category
+)
+
+micro_centroids <- otu_spike %>%
+  group_by(Condition) %>%
+  summarise(
+    across(
+      where(is.numeric),
+      mean
+    )
+  )
+
+micro_mat <- micro_centroids %>%
+  column_to_rownames("Condition") %>%
+  as.matrix()
+
+# ----------------------------------------------------
+# Biodegradation matrix
+# ----------------------------------------------------
+
+deg_mat <- resp %>%
+  select(
+    Compound,
+    `0 h`,
+    `24 h`,
+    `48 h`,
+    `72 h`
+  ) %>%
+  mutate(
+    across(
+      -Compound,
+      as.numeric
+    )
+  ) %>%
+  column_to_rownames("Compound") %>%
+  as.matrix()
+
+deg_mat <- t(deg_mat)
+
+deg_mat[is.na(deg_mat)] <- 0
+
+# ----------------------------------------------------
+# Distance matrices
+# ----------------------------------------------------
+
+micro_dist <- vegdist(
+  micro_mat,
+  method = "bray"
+)
+
+bio_dist <- dist(
+  deg_mat,
+  method = "euclidean"
+)
+
+# ----------------------------------------------------
+# Mantel test
+# ----------------------------------------------------
+
+mant <- mantel(
+  micro_dist,
+  bio_dist,
+  method = "spearman",
+  permutations = 9999
+)
+
+# ----------------------------------------------------
+# Ordinations
+# ----------------------------------------------------
+
+micro_nmds <- metaMDS(
+  micro_mat,
+  distance = "bray",
+  k = 2,
+  trymax = 100,
+  trace = 0
+)
+
+bio_nmds <- metaMDS(
+  deg_mat,
+  distance = "euclidean",
+  k = 2,
+  trymax = 100,
+  trace = 0
+)
+
+# ----------------------------------------------------
+# Procrustes
+# ----------------------------------------------------
+
+proc <- procrustes(
+  micro_nmds,
+  bio_nmds,
+  symmetric = TRUE
+)
+
+# ----------------------------------------------------
+# Plot data
+# ----------------------------------------------------
+
+plotdat <- data.frame(
+  Condition = rownames(proc$Yrot),
+
+  Micro1 = proc$X[,1],
+  Micro2 = proc$X[,2],
+
+  Bio1 = proc$Yrot[,1],
+  Bio2 = proc$Yrot[,2]
+)
+
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# ----------------------------------------------------
+# Plot data
+# ----------------------------------------------------
+
+micro_pts <- data.frame(
+  x = proc$X[,1],
+  y = proc$X[,2],
+  Condition = rownames(micro_mat),
+  Dataset = "Microbial"
+)
+
+bio_pts <- data.frame(
+  x = proc$Yrot[,1],
+  y = proc$Yrot[,2],
+  Condition = rownames(micro_mat),
+  Dataset = "Biodegradation"
+)
+
+points_all <- bind_rows(
+  micro_pts,
+  bio_pts
+)
+
+segments <- data.frame(
+  Condition = rownames(micro_mat),
+  x = proc$X[,1],
+  y = proc$X[,2],
+  xend = proc$Yrot[,1],
+  yend = proc$Yrot[,2]
+)
+
+cond_cols <- c(
+  "0 h"  = "#FEE0D2",
+  "24 h" = "#FC9272",
+  "48 h" = "#EF3B2C",
+  "72 h" = "#99000D"
+)
+
+# ----------------------------------------------------
+# Plot
+# ----------------------------------------------------
+
+p4a <- ggplot() +
+
+  geom_segment(
+    data = segments,
+    aes(
+      x = x,
+      y = y,
+      xend = xend,
+      yend = yend,
+      colour = Condition
+    ),
+    linewidth = 1.8,
+    alpha = 0.9
+  ) +
+
+  geom_point(
+    data = points_all,
+    aes(
+      x,
+      y,
+      colour = Condition,
+      shape = Dataset
+    ),
+    size = 6,
+    stroke = 1.2
+  ) +
+
+  geom_text(
+    data = bio_pts,
+    aes(
+      x,
+      y,
+      label = Condition
+    ),
+    nudge_y = 0.04,
+    size = 4
+  ) +
+
+  scale_colour_manual(
+    values = cond_cols,
+    name = "Conditioning"
+  ) +
+
+  scale_shape_manual(
+    name = "Dataset",
+    values = c(
+      "Microbial" = 16,
+      "Biodegradation" = 8
+    )
+  ) +
+
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.05,
+    vjust = 1,
+    size = 4.5,
+    label = paste0(
+      "Mantel r = ",
+      round(mant$statistic, 2),
+      "\n",
+      "p = ",
+      signif(mant$signif, 3)
+    )
+  ) +
+
+  labs(
+    y = "Biodegradation dissimilarity",
+    x = "Microbial Bray-Curtis dissimilarity"
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+
+  legend.position = "right",
+
+  legend.title = element_text(
+    face = "bold"
+  ),
+
+  panel.border = element_blank()
+)
+
+p4a     
+
+proc_test <- protest(
+  micro_nmds,
+  bio_nmds,
+  permutations = 9999
+)
+
+proc_test
+```
+
+### Figure 4A: Emergent compounds vs significant ANCOM genera
+
+```{r}
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# =====================================================
+# Figure 4A
+# Emergent compounds vs significant ANCOM genera
+# =====================================================
+
+# -----------------------------------------------------
+# ANCOM taxa
+# -----------------------------------------------------
+
+res <- ancom.out$res
+
+lfc_cols <- grep(
+  "^lfc_CategorySpike",
+  names(res),
+  value = TRUE
+)
+
+q_cols <- grep(
+  "^q_CategorySpike",
+  names(res),
+  value = TRUE
+)
+
+ancom_tbl <- purrr::map_dfr(
+  seq_len(nrow(res)),
+  function(i){
+
+    lfc <- as.numeric(res[i, lfc_cols])
+    q <- as.numeric(res[i, q_cols])
+
+    tibble(
+      Genus = res$taxon[i],
+      max_logFC = max(abs(lfc), na.rm = TRUE),
+      min_q = min(q, na.rm = TRUE)
+    )
+  }
+)
+
+sig_taxa <- ancom_tbl %>%
+  filter(min_q < 0.05) %>%
+  pull(Genus)
+
+# -----------------------------------------------------
+# OTU lookup
+# -----------------------------------------------------
+
+otu <- mco$taxa_abund$Genus
+
+tax_lookup <- tibble(
+  Taxonomy = rownames(otu),
+  Genus = sub(
+    ".*\\|",
+    "",
+    rownames(otu)
+  )
+)
+
+# -----------------------------------------------------
+# Metadata
+# -----------------------------------------------------
+
+meta <- mco$sample_table %>%
+  tibble::rownames_to_column("Sample")
+
+conds <- c(
+  "0 h",
+  "24 h",
+  "48 h",
+  "72 h"
+)
+
+# -----------------------------------------------------
+# Taxon trajectories
+# -----------------------------------------------------
+
+tax_mat <- matrix(
+  NA,
+  nrow = length(sig_taxa),
+  ncol = 4,
+  dimnames = list(
+    gsub("^g__", "", sig_taxa),
+    conds
+  )
+)
+
+for(i in seq_along(sig_taxa)){
+
+  genus <- sig_taxa[i]
+
+  hits <- tax_lookup %>%
+    filter(
+      Genus == genus
+    )
+
+  if(nrow(hits) == 0)
+    next
+
+  for(j in seq_along(conds)){
+
+    samps <- meta %>%
+      filter(
+        Category ==
+          paste0(
+            "Spike - ",
+            conds[j]
+          )
+      ) %>%
+      pull(Sample)
+
+    tmp <- otu[
+      hits$Taxonomy,
+      samps,
+      drop = FALSE
+    ]
+
+    tmp <- as.matrix(tmp)
+
+    tax_mat[i,j] <- mean(
+      colSums(
+        tmp,
+        na.rm = TRUE
+      ),
+      na.rm = TRUE
+    )
+  }
+}
+
+# remove taxa with all NA
+
+tax_mat <- tax_mat[
+  rowSums(
+    is.na(tax_mat)
+  ) < ncol(tax_mat),
+  ,
+  drop = FALSE
+]
+
+# -----------------------------------------------------
+# Emergent compounds only
+# -----------------------------------------------------
+
+emergent_compounds <- resp %>%
+  filter(
+    Response == "Emergent"
+  ) %>%
+  pull(Compound)
+
+comp_mat <- resp %>%
+  filter(
+    Compound %in% emergent_compounds
+  ) %>%
+  select(
+    Compound,
+    `0 h`,
+    `24 h`,
+    `48 h`,
+    `72 h`
+  ) %>%
+  column_to_rownames(
+    "Compound"
+  ) %>%
+  as.matrix()
+
+comp_mat[
+  is.na(comp_mat)
+] <- 0
+
+# -----------------------------------------------------
+# Spearman correlation matrix
+# -----------------------------------------------------
+
+cor_mat <- matrix(
+  0,
+  nrow = nrow(comp_mat),
+  ncol = nrow(tax_mat),
+  dimnames = list(
+    rownames(comp_mat),
+    rownames(tax_mat)
+  )
+)
+
+for(i in seq_len(nrow(comp_mat))){
+
+  comp_traj <- as.numeric(
+    comp_mat[i, ]
+  )
+
+  for(j in seq_len(nrow(tax_mat))){
+
+    tax_traj <- as.numeric(
+      tax_mat[j, ]
+    )
+
+    if(
+      sd(comp_traj) > 0 &
+      sd(tax_traj) > 0
+    ){
+
+      cor_mat[i,j] <- suppressWarnings(
+        cor(
+          comp_traj,
+          tax_traj,
+          method = "spearman"
+        )
+      )
+
+    } else {
+
+      cor_mat[i,j] <- 0
+    }
+  }
+}
+
+# -----------------------------------------------------
+# Strongest associations
+# -----------------------------------------------------
+
+assoc_tbl <- as.data.frame(
+  as.table(cor_mat)
+)
+
+colnames(
+  assoc_tbl
+) <- c(
+  "Compound",
+  "Taxon",
+  "Rho"
+)
+
+assoc_tbl <- assoc_tbl %>%
+  arrange(
+    desc(abs(Rho))
+  )
+
+head(
+  assoc_tbl,
+  20
+)
+
+# -----------------------------------------------------
+# Heatmap
+# -----------------------------------------------------
+
+col_fun <- colorRamp2(
+  c(-1, 0, 1),
+  c(
+    "#2166AC",
+    "white",
+    "#B2182B"
+  )
+)
+
+ht <- Heatmap(
+  cor_mat,
+
+  name = "Spearman rho",
+
+  col = col_fun,
+  column_split = 4, row_split = 4,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+
+  show_row_names = TRUE,
+
+  row_names_side = "left",
+
+  row_names_gp = gpar(
+    fontsize = 8
+  ),
+
+  column_names_gp = gpar(
+    fontsize = 8,
+    fontface = "italic"
+  ),
+
+  row_title = "Emergent compounds",
+
+  column_title = "Significant ANCOM genera",
+
+  heatmap_legend_param = list(
+    title = "rho"
+  ),
+
+  cell_fun = function(
+    j,
+    i,
+    x,
+    y,
+    width,
+    height,
+    fill
+  ){
+
+    if(abs(cor_mat[i,j]) >= 0.8){
+
+      grid.text(
+        "*",
+        x,
+        y,
+        gp = gpar(
+          fontsize = 10,
+          fontface = "bold"
+        )
+      )
+    }
+  }
+)
+
+draw(ht)
+```
+
+### Figure 4B: Emergent compounds × ANCOM taxa network
+
+```{r}
+library(tidyverse)
+library(tidygraph)
+library(ggraph)
+
+# =====================================================
+# Figure 4B
+# Emergent compounds × ANCOM taxa network
+# =====================================================
+
+# -----------------------------------------------------
+# Strong associations
+# -----------------------------------------------------
+
+strong_edges <- assoc_tbl %>%
+  filter(abs(Rho) >= 0.9)
+
+# -----------------------------------------------------
+# Manual phylum assignments
+# -----------------------------------------------------
+
+phylum_lookup <- tribble(
+  ~name, ~Phylum,
+
+  "Piscinibacter",              "Pseudomonadota",
+  "Brevundimonas",              "Pseudomonadota",
+  "Novosphingobium",            "Pseudomonadota",
+  "Thermomonas",                "Pseudomonadota",
+  "mle1-7",                     "Pseudomonadota",
+  "Unc. SC-I-84",               "Pseudomonadota",
+  "Pseudothioclava",            "Pseudomonadota",
+
+  "Ferruginibacter",            "Bacteroidota",
+  "Parasegetibacter",           "Bacteroidota",
+  "Unc. Saprospiraceae",        "Bacteroidota",
+  "Unc. CCM19a",                "Bacteroidota",
+
+  "Acidibacter",                "Acidobacteriota",
+  "Unc. Blastocatellaceae",     "Acidobacteriota",
+  "Unc. Vicinamibacterales",    "Acidobacteriota",
+
+  "Nitrospira",                 "Nitrospirota",
+
+  "Gemmata",                    "Planctomycetota",
+  "Unc. WD260",                 "Planctomycetota",
+
+  "Stenotrophobacter",          "Gemmatimonadota",
+  "Unc. Gemmatimonadaceae",     "Gemmatimonadota",
+
+  "Unc. Gaiellales",            "Actinomycetota",
+
+  "AAP99",                      "Chloroflexota",
+  "Unc. SHA-26",                "Chloroflexota",
+  "Unc. Thermomicrobiales",     "Chloroflexota",
+  "Unc. JG30-KF-CM66",          "Chloroflexota",
+  "Unc. Aggregatilineaceae",    "Chloroflexota",
+
+  "Unc. A4b",                   "Patescibacteria"
+)
+
+# -----------------------------------------------------
+# Taxa nodes
+# -----------------------------------------------------
+
+taxa_nodes <- tibble(
+  name = unique(strong_edges$Taxon)
+) %>%
+  left_join(
+    phylum_lookup,
+    by = "name"
+  ) %>%
+  mutate(
+    type = "Taxon"
+  )
+
+# -----------------------------------------------------
+# Compound nodes
+# -----------------------------------------------------
+
+compound_nodes <- tibble(
+  name = unique(strong_edges$Compound),
+  type = "Compound",
+  Phylum = "Compound"
+)
+
+# -----------------------------------------------------
+# Combine nodes
+# -----------------------------------------------------
+
+nodes <- bind_rows(
+  taxa_nodes,
+  compound_nodes
+) %>%
+  mutate(
+    Phylum = replace_na(
+      Phylum,
+      "Other"
+    )
+  )
+
+# -----------------------------------------------------
+# Edges
+# -----------------------------------------------------
+
+edges <- strong_edges %>%
+  mutate(
+    Association = ifelse(
+      Rho > 0,
+      "Positive",
+      "Negative"
+    )
+  ) %>%
+  transmute(
+    from = match(
+      Taxon,
+      nodes$name
+    ),
+    to = match(
+      Compound,
+      nodes$name
+    ),
+    rho = abs(Rho),
+    Association
+  )
+
+# -----------------------------------------------------
+# Graph
+# -----------------------------------------------------
+
+graph <- tbl_graph(
+  nodes = nodes,
+  edges = edges,
+  directed = FALSE
+)
+
+# -----------------------------------------------------
+# Figure 4B
+# -----------------------------------------------------
+
+p4b <- ggraph(
+  graph,
+  layout = "kk"
+) +
+
+  # -------------------------
+  # Edges
+  # -------------------------
+
+  geom_edge_link(
+    aes(
+      colour = Association,
+      width = rho
+    ),
+    alpha = 0.5
+  ) +
+
+  scale_edge_colour_manual(
+    name = "Association",
+    values = c(
+      Positive = "#B2182B",
+      Negative = "#2166AC"
+    )
+  ) +
+
+  scale_edge_width(
+    name = expression("|" * rho * "|"),
+    range = c(0.5, 2.5)
+  ) +
+
+  # -------------------------
+  # Nodes
+  # -------------------------
+
+  geom_node_point(
+    aes(
+      shape = type,
+      fill = Phylum
+    ),
+    size = 6,
+    colour = "black",
+    stroke = 0.6
+  ) +
+
+  scale_shape_manual(
+    values = c(
+      Taxon = 21,
+      Compound = 22
+    ),
+    guide = "none"
+  ) +
+
+  scale_fill_manual(
+    name = "Phylum",
+
+    values = c(
+      Compound = "#8E63CE",
+
+      Pseudomonadota = "#1F78B4",
+      Bacteroidota = "#33A02C",
+      Acidobacteriota = "#FF7F00",
+      Actinomycetota = "#E31A1C",
+      Chloroflexota = "#A6CEE3",
+      Gemmatimonadota = "#B15928",
+      Planctomycetota = "#6A3D9A",
+      Nitrospirota = "#FB9A99",
+      Patescibacteria = "#CAB2D6",
+
+      Other = "grey70"
+    ),
+
+    guide = guide_legend(
+      override.aes = list(
+        shape = 21,
+        size = 6,
+        colour = "black"
+      )
+    )
+  ) +
+
+  # -------------------------
+  # Taxa labels
+  # -------------------------
+
+  geom_node_text(
+    data = function(x)
+      dplyr::filter(
+        x,
+        type == "Taxon"
+      ),
+    aes(label = name),
+    fontface = "italic",
+    size = 4,
+    repel = TRUE
+  ) +
+
+  # -------------------------
+  # Compound labels
+  # -------------------------
+
+  geom_node_text(
+    data = function(x)
+      dplyr::filter(
+        x,
+        type == "Compound"
+      ),
+    aes(label = name),
+    fontface = "bold",
+    size = 5,
+    repel = TRUE
+  ) +
+
+  theme_void() +
+
+  theme(
+    legend.position = "right",
+
+    legend.title = element_text(
+      face = "bold",
+      size = 11
+    ),
+
+    legend.text = element_text(
+      size = 10
+    )
+  )
+
+p4b
+```
+
+### Supplementary Figure S4: All biodegradable compounds × ANCOM-significant taxa
+
+```{r}
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# =====================================================
+# Supplementary Figure S4
+# All biodegradable compounds × ANCOM-significant taxa
+# =====================================================
+
+# -----------------------------------------------------
+# ANCOM taxa
+# -----------------------------------------------------
+
+res <- ancom.out$res
+
+lfc_cols <- grep(
+  "^lfc_CategorySpike",
+  names(res),
+  value = TRUE
+)
+
+q_cols <- grep(
+  "^q_CategorySpike",
+  names(res),
+  value = TRUE
+)
+
+ancom_tbl <- purrr::map_dfr(
+  seq_len(nrow(res)),
+  function(i){
+
+    lfc <- as.numeric(res[i, lfc_cols])
+    q   <- as.numeric(res[i, q_cols])
+
+    tibble(
+      Genus = res$taxon[i],
+      max_logFC = max(abs(lfc), na.rm = TRUE),
+      min_q = min(q, na.rm = TRUE)
+    )
+  }
+)
+
+sig_taxa <- ancom_tbl %>%
+  filter(min_q < 0.05) %>%
+  pull(Genus)
+
+# -----------------------------------------------------
+# OTU lookup
+# -----------------------------------------------------
+
+otu <- mco$taxa_abund$Genus
+
+tax_lookup <- tibble(
+  Taxonomy = rownames(otu),
+  Genus = sub(
+    ".*\\|",
+    "",
+    rownames(otu)
+  )
+)
+
+# -----------------------------------------------------
+# Metadata
+# -----------------------------------------------------
+
+meta <- mco$sample_table %>%
+  rownames_to_column("Sample")
+
+conds <- c(
+  "0 h",
+  "24 h",
+  "48 h",
+  "72 h"
+)
+
+# -----------------------------------------------------
+# Taxon trajectories
+# -----------------------------------------------------
+
+tax_mat <- matrix(
+  NA,
+  nrow = length(sig_taxa),
+  ncol = 4,
+  dimnames = list(
+    gsub("^g__", "", sig_taxa),
+    conds
+  )
+)
+
+for(i in seq_along(sig_taxa)){
+
+  genus <- sig_taxa[i]
+
+  hits <- tax_lookup %>%
+    filter(Genus == genus)
+
+  if(nrow(hits) == 0)
+    next
+
+  for(j in seq_along(conds)){
+
+    samps <- meta %>%
+      filter(
+        Category ==
+          paste0(
+            "Spike - ",
+            conds[j]
+          )
+      ) %>%
+      pull(Sample)
+
+    tmp <- otu[
+      hits$Taxonomy,
+      samps,
+      drop = FALSE
+    ]
+
+    tmp <- as.matrix(tmp)
+
+    tax_mat[i,j] <- mean(
+      colSums(tmp),
+      na.rm = TRUE
+    )
+  }
+}
+
+tax_mat <- tax_mat[
+  rowSums(is.na(tax_mat)) < ncol(tax_mat),
+  ,
+  drop = FALSE
+]
+
+# -----------------------------------------------------
+# All biodegradable compounds
+# -----------------------------------------------------
+
+comp_mat <- resp %>%
+  select(
+    Compound,
+    `0 h`,
+    `24 h`,
+    `48 h`,
+    `72 h`
+  ) %>%
+  column_to_rownames("Compound") %>%
+  as.matrix()
+
+comp_mat[is.na(comp_mat)] <- 0
+
+# -----------------------------------------------------
+# Correlation matrix
+# -----------------------------------------------------
+
+cor_mat <- matrix(
+  0,
+  nrow = nrow(comp_mat),
+  ncol = nrow(tax_mat),
+  dimnames = list(
+    rownames(comp_mat),
+    rownames(tax_mat)
+  )
+)
+
+for(i in seq_len(nrow(comp_mat))){
+
+  comp_traj <- as.numeric(
+    comp_mat[i, ]
+  )
+
+  for(j in seq_len(nrow(tax_mat))){
+
+    tax_traj <- as.numeric(
+      tax_mat[j, ]
+    )
+
+    if(
+      sd(comp_traj) > 0 &
+      sd(tax_traj) > 0
+    ){
+
+      cor_mat[i,j] <- suppressWarnings(
+        cor(
+          comp_traj,
+          tax_traj,
+          method = "spearman"
+        )
+      )
+
+    } else {
+
+      cor_mat[i,j] <- 0
+    }
+  }
+}
+
+# -----------------------------------------------------
+# Compound annotations
+# -----------------------------------------------------
+
+row_info <- resp %>%
+  select(
+    Compound,
+    Response
+  ) %>%
+  filter(
+    Compound %in% rownames(cor_mat)
+  )
+
+row_info <- row_info[
+  match(
+    rownames(cor_mat),
+    row_info$Compound
+  ),
+]
+
+row_ha <- rowAnnotation(
+
+  Response = row_info$Response,
+
+  col = list(
+    Response = c(
+      "Emergent" = "#49006A",
+      "Enhanced" = "#C51B8A",
+      "Reduced" = "grey60",
+      "No substantial response" = "#D9D9D9"
+    )
+  ),
+
+  width = unit(4, "mm")
+)
+
+# -----------------------------------------------------
+# Colour palette
+# -----------------------------------------------------
+
+col_fun <- colorRamp2(
+  c(-1, 0, 1),
+  c(
+    "#2166AC",
+    "white",
+    "#B2182B"
+  )
+)
+
+# -----------------------------------------------------
+# Heatmap
+# -----------------------------------------------------
+
+ht <- Heatmap(
+
+  cor_mat,
+
+  name = "Spearman rho",
+
+  col = col_fun,
+
+  right_annotation = row_ha,
+
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+
+  row_names_side = "left",
+  row_split = row_info$Response, 
+  row_names_gp = gpar(
+    fontsize = 7
+  ),
+
+  column_names_gp = gpar(
+    fontsize = 8,
+    fontface = "italic"
+  ),
+
+  heatmap_legend_param = list(
+    title = expression(rho)
+  ),
+
+  row_title = "Biodegradable compounds",
+  column_title = "ANCOM-significant genera"
+)
+
+draw(ht)
+```
+
+### Supplementary Figure S5: All biodegradable compounds × ANCOM taxa network
+
+```{r}
+library(tidyverse)
+library(tidygraph)
+library(ggraph)
+
+# =====================================================
+# Supplementary Figure S5
+# All biodegradable compounds × ANCOM taxa network
+# =====================================================
+
+# -----------------------------------------------------
+# Keep strong associations
+# -----------------------------------------------------
+
+strong_edges <- assoc_tbl %>%
+  filter(abs(Rho) >= 0.9)
+
+# -----------------------------------------------------
+# Compound response category
+# -----------------------------------------------------
+
+compound_info <- resp %>%
+  select(
+    Compound,
+    Response
+  )
+
+# -----------------------------------------------------
+# Taxa nodes
+# -----------------------------------------------------
+
+taxa_nodes <- tibble(
+  name = unique(strong_edges$Taxon),
+  type = "Taxon"
+)
+
+# -----------------------------------------------------
+# Compound nodes
+# -----------------------------------------------------
+
+compound_nodes <- tibble(
+  name = unique(strong_edges$Compound)
+) %>%
+  left_join(
+    compound_info,
+    by = c("name" = "Compound")
+  ) %>%
+  mutate(
+    type = "Compound"
+  )
+
+# -----------------------------------------------------
+# Combine nodes
+# -----------------------------------------------------
+
+nodes <- bind_rows(
+  taxa_nodes,
+  compound_nodes
+)
+
+# -----------------------------------------------------
+# Edges
+# -----------------------------------------------------
+
+edges <- strong_edges %>%
+  mutate(
+    Association = ifelse(
+      Rho > 0,
+      "Positive",
+      "Negative"
+    )
+  ) %>%
+  transmute(
+    from = match(
+      Taxon,
+      nodes$name
+    ),
+    to = match(
+      Compound,
+      nodes$name
+    ),
+    rho = abs(Rho),
+    Association
+  )
+
+# -----------------------------------------------------
+# Graph
+# -----------------------------------------------------
+
+graph <- tbl_graph(
+  nodes = nodes,
+  edges = edges,
+  directed = FALSE
+)
+
+# -----------------------------------------------------
+# Figure S5
+# -----------------------------------------------------
+
+pS5 <- ggraph(
+  graph,
+  layout = "kk"
+) +
+
+  # -----------------------------------------
+  # Edges
+  # -----------------------------------------
+
+  geom_edge_link(
+    aes(
+      colour = Association,
+      width = rho
+    ),
+    alpha = 0.5
+  ) +
+
+  scale_edge_colour_manual(
+    values = c(
+      Positive = "#B2182B",
+      Negative = "#2166AC"
+    )
+  ) +
+
+  scale_edge_width(
+    range = c(0.8, 2.5)
+  ) +
+
+  # -----------------------------------------
+  # Taxa
+  # -----------------------------------------
+
+  geom_node_point(
+    data = function(x)
+      dplyr::filter(
+        x,
+        type == "Taxon"
+      ),
+    shape = 21,
+    fill = "#5AAE61",
+    colour = "black",
+    size = 5,
+    stroke = 0.5
+  ) +
+
+  # -----------------------------------------
+  # Compounds
+  # -----------------------------------------
+
+  geom_node_point(
+    data = function(x)
+      dplyr::filter(
+        x,
+        type == "Compound"
+      ),
+    aes(
+      fill = Response
+    ),
+    shape = 22,
+    colour = "black",
+    size = 5,
+    stroke = 0.5
+  ) +
+
+  # -----------------------------------------
+  # Labels
+  # -----------------------------------------
+
+  geom_node_text(
+    aes(
+      label = name
+    ),
+    size = 3,
+    repel = TRUE
+  ) +
+
+  # -----------------------------------------
+  # Response colours
+  # -----------------------------------------
+
+  scale_fill_manual(
+    name = "Response category",
+    values = c(
+      "Emergent" = "#49006A",
+      "Enhanced" = "#C51B8A",
+      "Reduced" = "#3182BD",
+      "No substantial response" = "#D9D9D9"
+    )
+  ) +
+
+  labs(
+    edge_colour = "Association",
+    edge_width = expression("|" * rho * "|")
+  ) +
+
+  theme_void(base_size = 12) +
+
+  theme(
+    legend.position = "right",
+
+    legend.title = element_text(
+      face = "bold"
+    ),
+
+    legend.text = element_text(
+      size = 10
+    )
+  )
+
+pS5
+```
+
+## Others: Supplementary information
+
+### Table S5: Alpha-diversity statistics
+
+```{r}
+library(tidyverse)
+library(tibble)
+library(rstatix)
+library(openxlsx)
+
+# ====================================================
+# TABLE S5
+# Alpha-diversity statistics
+# ====================================================
+
+# Metadata + alpha diversity
+alpha <- mco$alpha_diversity %>%
+  rownames_to_column("Sample") %>%
+  left_join(
+    mco$sample_table %>%
+      rownames_to_column("Sample"),
+    by = "Sample"
+  )
+
+# Keep only treatments used in Fig. 1
+alpha <- alpha %>%
+  filter(
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+
+# Order
+alpha$Category <- factor(
+  alpha$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+)
+
+# ====================================================
+# Summary statistics
+# ====================================================
+
+metrics <- c(
+  "Observed",
+  "Shannon",
+  "Pielou"
+)
+
+summary.list <- list()
+
+for(m in metrics){
+
+  tmp <- alpha %>%
+    group_by(Category) %>%
+    summarise(
+      Metric = m,
+      Mean = mean(.data[[m]], na.rm = TRUE),
+      SD = sd(.data[[m]], na.rm = TRUE),
+      Median = median(.data[[m]], na.rm = TRUE),
+      Min = min(.data[[m]], na.rm = TRUE),
+      Max = max(.data[[m]], na.rm = TRUE),
+      N = n(),
+      .groups = "drop"
+    )
+
+  summary.list[[m]] <- tmp
+}
+
+summary.tab <- bind_rows(summary.list)
+
+# ====================================================
+# Kruskal-Wallis
+# ====================================================
+
+kw.list <- list()
+
+for(m in metrics){
+
+  kw <- kruskal.test(
+    alpha[[m]] ~ alpha$Category
+  )
+
+  kw.list[[m]] <- data.frame(
+    Metric = m,
+    ChiSquare = as.numeric(kw$statistic),
+    DF = as.numeric(kw$parameter),
+    Pvalue = kw$p.value
+  )
+}
+
+kw.tab <- bind_rows(kw.list)
+
+# ====================================================
+# Dunn post hoc tests
+# ====================================================
+
+pair.list <- list()
+
+for(m in metrics){
+
+  res <- alpha %>%
+    dunn_test(
+      formula = as.formula(
+        paste(m, "~ Category")
+      ),
+      p.adjust.method = "BH"
+    ) %>%
+    mutate(
+      Metric = m
+    )
+
+  pair.list[[m]] <- res
+}
+
+pair.tab <- bind_rows(pair.list)
+
+# ====================================================
+# Export to Excel
+# ====================================================
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Summary")
+writeData(
+  wb,
+  "Summary",
+  summary.tab
+)
+
+addWorksheet(wb, "KruskalWallis")
+writeData(
+  wb,
+  "KruskalWallis",
+  kw.tab
+)
+
+addWorksheet(wb, "DunnTest")
+writeData(
+  wb,
+  "DunnTest",
+  pair.tab
+)
+
+saveWorkbook(
+  wb,
+  "Supplementary_Table_S5_AlphaDiversity.xlsx",
+  overwrite = TRUE
+)
+
+# ====================================================
+# Optional: inspect results
+# ====================================================
+
+summary.tab
+kw.tab
+pair.tab
+```
+
+### Table S6: Community composition analyses
+
+```{r}
+library(tidyverse)
+library(vegan)
+library(openxlsx)
+library(tibble)
+
+# ====================================================
+# TABLE S6
+# Community composition analyses
+# ====================================================
+
+# ----------------------------------------------------
+# Samples used in conditioning analysis
+# ----------------------------------------------------
+
+keep_samples <- rownames(
+  subset(
+    mco$sample_table,
+    Category %in% c(
+      "Field",
+      "Spike - 0 h",
+      "Spike - 24 h",
+      "Spike - 48 h",
+      "Spike - 72 h"
+    )
+  )
+)
+
+# ----------------------------------------------------
+# Metadata
+# ----------------------------------------------------
+
+meta <- mco$sample_table[
+  keep_samples,
+  ,
+  drop = FALSE
+]
+
+meta$Category <- factor(
+  meta$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+)
+
+# ----------------------------------------------------
+# Bray-Curtis PERMANOVA
+# ----------------------------------------------------
+
+bray <- as.dist(
+  mco$beta_diversity$bray[
+    keep_samples,
+    keep_samples
+  ]
+)
+
+perm.bray <- adonis2(
+  bray ~ Category,
+  data = meta,
+  permutations = 999
+)
+
+bray.tab <- as.data.frame(perm.bray) %>%
+  rownames_to_column("Term")
+
+# ----------------------------------------------------
+# Weighted UniFrac PERMANOVA
+# ----------------------------------------------------
+
+wuni <- as.dist(
+  mco$beta_diversity$wei_unifrac[
+    keep_samples,
+    keep_samples
+  ]
+)
+
+perm.wuni <- adonis2(
+  wuni ~ Category,
+  data = meta,
+  permutations = 999
+)
+
+wuni.tab <- as.data.frame(perm.wuni) %>%
+  rownames_to_column("Term")
+
+# ----------------------------------------------------
+# Export workbook
+# ----------------------------------------------------
+
+wb <- createWorkbook()
+
+addWorksheet(
+  wb,
+  "Bray-Curtis"
+)
+
+writeData(
+  wb,
+  "Bray-Curtis",
+  bray.tab
+)
+
+addWorksheet(
+  wb,
+  "Weighted UniFrac"
+)
+
+writeData(
+  wb,
+  "Weighted UniFrac",
+  wuni.tab
+)
+
+saveWorkbook(
+  wb,
+  "Supplementary_Table_S6_CommunityComposition.xlsx",
+  overwrite = TRUE
+)
+
+# ----------------------------------------------------
+# Inspect results
+# ----------------------------------------------------
+
+bray.tab
+wuni.tab
+```
+
+
+
+### Table S7: Indicator taxa
+
+```{r}
+library(phyloseq)
+library(indicspecies)
+library(tidyverse)
+library(tibble)
+library(openxlsx)
+
+# ====================================================
+# TABLE S7
+# Indicator taxa
+# ====================================================
+
+# ----------------------------------------------------
+# Convert to phyloseq object
+# ----------------------------------------------------
+
+ps <- file2meco::meco2phyloseq(mco)
+
+# ----------------------------------------------------
+# Keep Field + Spike samples only
+# ----------------------------------------------------
+
+keep <- sample_names(ps)[
+  sample_data(ps)$Category %in% c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+]
+
+ps <- prune_samples(keep, ps)
+
+# ----------------------------------------------------
+# Aggregate to genus level
+# ----------------------------------------------------
+
+ps.gen <- tax_glom(
+  ps,
+  taxrank = "Genus",
+  NArm = FALSE
+)
+
+# ----------------------------------------------------
+# Extract abundance table
+# ----------------------------------------------------
+
+otu <- as.data.frame(
+  otu_table(ps.gen)
+)
+
+if(!taxa_are_rows(ps.gen)){
+  otu <- t(otu)
+}
+
+otu <- as.data.frame(otu)
+
+# ----------------------------------------------------
+# Taxonomy
+# ----------------------------------------------------
+
+tax <- as.data.frame(
+  tax_table(ps.gen)
+)
+
+tax$Genus <- as.character(
+  tax$Genus
+)
+
+tax$Genus <- gsub(
+  "^g__",
+  "",
+  tax$Genus
+)
+
+tax$Genus[
+  is.na(tax$Genus) |
+  tax$Genus == ""
+] <- "Unclassified"
+
+rownames(otu) <- make.unique(
+  tax$Genus
+)
+
+# ----------------------------------------------------
+# Metadata
+# ----------------------------------------------------
+
+meta <- as.data.frame(
+  sample_data(ps.gen)
+)
+
+group <- factor(
+  meta$Category,
+  levels = c(
+    "Field",
+    "Spike - 0 h",
+    "Spike - 24 h",
+    "Spike - 48 h",
+    "Spike - 72 h"
+  )
+)
+
+# ----------------------------------------------------
+# Indicator species analysis
+# ----------------------------------------------------
+
+ind <- multipatt(
+  t(otu),
+  group,
+  func = "IndVal.g",
+  control = how(
+    nperm = 999
+  )
+)
+
+# ----------------------------------------------------
+# Full results
+# ----------------------------------------------------
+
+full.tab <- ind$sign %>%
+  as.data.frame() %>%
+  rownames_to_column("Genus")
+
+# -----------------------------------------------------
+# Determine indicator treatment
+# -----------------------------------------------------
+
+grp.cols <- grep(
+  "^s\\.",
+  names(full.tab),
+  value = TRUE
+)
+
+# Convert to matrix
+grp.mat <- as.matrix(
+  full.tab[, grp.cols]
+)
+
+# Determine the group with the highest indicator value
+full.tab$IndicatorGroup <- apply(
+  grp.mat,
+  1,
+  function(x){
+    grp.cols[which.max(as.numeric(x))]
+  }
+)
+
+full.tab$IndicatorGroup <- gsub(
+  "^s\\.",
+  "",
+  full.tab$IndicatorGroup
+)
+
+# ----------------------------------------------------
+# Significant taxa only
+# ----------------------------------------------------
+
+sig.tab <- full.tab %>%
+  filter(
+    p.value < 0.05
+  ) %>%
+  arrange(
+    p.value
+  )
+
+# ----------------------------------------------------
+# Export
+# ----------------------------------------------------
+
+wb <- createWorkbook()
+
+addWorksheet(
+  wb,
+  "All Indicator Taxa"
+)
+
+writeData(
+  wb,
+  "All Indicator Taxa",
+  full.tab
+)
+
+addWorksheet(
+  wb,
+  "Significant Taxa"
+)
+
+writeData(
+  wb,
+  "Significant Taxa",
+  sig.tab
+)
+
+saveWorkbook(
+  wb,
+  "Supplementary_Table_S7_IndicatorTaxa.xlsx",
+  overwrite = TRUE
+)
+
+# ----------------------------------------------------
+# Inspect
+# ----------------------------------------------------
+
+head(sig.tab)
+```
+
+### Table S8: ANCOM-BC2 Results
+
+```{r}
+library(ANCOMBC)
+library(phyloseq)
+library(tidyverse)
+library(tibble)
+library(openxlsx)
+library(ggrepel)
+
+# ====================================================
+# TABLE S8
+# ANCOM-BC2 Results
+# ====================================================
+
+# ANCOM object already generated in Figure 3E
+
+res <- ancom.out$res
+
+# ----------------------------------------------------
+# Sheet 1
+# Full ANCOM output
+# ----------------------------------------------------
+
+full.tab <- res
+
+# ----------------------------------------------------
+# Sheet 2
+# Summary table
+# Largest response per genus
+# ----------------------------------------------------
+
+lfc_cols <- grep(
+  "^lfc_",
+  names(res),
+  value = TRUE
+)
+
+q_cols <- grep(
+  "^q_",
+  names(res),
+  value = TRUE
+)
+
+summary.tab <- purrr::map_dfr(
+  seq_len(nrow(res)),
+  function(i){
+
+    lfc <- as.numeric(
+      res[i, lfc_cols]
+    )
+
+    q <- as.numeric(
+      res[i, q_cols]
+    )
+
+    best <- which.max(
+      abs(lfc)
+    )
+
+    tibble(
+      Genus = res$taxon[i],
+      Treatment = lfc_cols[best],
+      Log2FC = lfc[best],
+      Qvalue = q[best],
+      Significant = q[best] < 0.05
+    )
+  }
+)
+
+summary.tab <- summary.tab %>%
+  mutate(
+    Genus = gsub(
+      "^g__",
+      "",
+      Genus
+    )
+  ) %>%
+  arrange(
+    Qvalue
+  )
+
+# ----------------------------------------------------
+# Significant genera only
+# ----------------------------------------------------
+
+sig.tab <- summary.tab %>%
+  filter(
+    Significant == TRUE
+  )
+
+# ----------------------------------------------------
+# Export workbook
+# ----------------------------------------------------
+
+wb <- createWorkbook()
+
+addWorksheet(
+  wb,
+  "Full ANCOM Output"
+)
+
+writeData(
+  wb,
+  "Full ANCOM Output",
+  full.tab
+)
+
+addWorksheet(
+  wb,
+  "Summary"
+)
+
+writeData(
+  wb,
+  "Summary",
+  summary.tab
+)
+
+addWorksheet(
+  wb,
+  "Significant Genera"
+)
+
+writeData(
+  wb,
+  "Significant Genera",
+  sig.tab
+)
+
+saveWorkbook(
+  wb,
+  "Supplementary_Table_S8_ANCOMBC2.xlsx",
+  overwrite = TRUE
+)
+
+# Inspect
+head(sig.tab)
+```
+
+### Table S9: Compound-taxon associations
+
+```{r}
+library(tidyverse)
+library(openxlsx)
+
+# =====================================================
+# TABLE S9
+# Compound-taxon associations
+# =====================================================
+
+# -----------------------------------------------------
+# Convert correlation matrix to long format
+# -----------------------------------------------------
+
+assoc.tab <- as.data.frame(
+  as.table(cor_mat)
+)
+
+colnames(assoc.tab) <- c(
+  "Compound",
+  "Taxon",
+  "SpearmanRho"
+)
+
+# -----------------------------------------------------
+# Sort by strength
+# -----------------------------------------------------
+
+assoc.tab <- assoc.tab %>%
+  arrange(
+    desc(abs(SpearmanRho))
+  ) %>%
+  mutate(
+    Association = case_when(
+      SpearmanRho > 0 ~ "Positive",
+      SpearmanRho < 0 ~ "Negative",
+      TRUE ~ "Neutral"
+    )
+  )
+
+# -----------------------------------------------------
+# Strong associations
+# Used in heatmap interpretation
+# -----------------------------------------------------
+
+strong.tab <- assoc.tab %>%
+  filter(
+    abs(SpearmanRho) >= 0.8
+  )
+
+# -----------------------------------------------------
+# Very strong associations
+# Used for network analysis
+# -----------------------------------------------------
+
+network.tab <- assoc.tab %>%
+  filter(
+    abs(SpearmanRho) >= 0.9
+  )
+
+# -----------------------------------------------------
+# Export workbook
+# -----------------------------------------------------
+
+wb <- createWorkbook()
+
+addWorksheet(
+  wb,
+  "All Associations"
+)
+
+writeData(
+  wb,
+  "All Associations",
+  assoc.tab
+)
+
+addWorksheet(
+  wb,
+  "Strong Associations"
+)
+
+writeData(
+  wb,
+  "Strong Associations",
+  strong.tab
+)
+
+addWorksheet(
+  wb,
+  "Network Associations"
+)
+
+writeData(
+  wb,
+  "Network Associations",
+  network.tab
+)
+
+saveWorkbook(
+  wb,
+  "Supplementary_Table_S9_CompoundTaxonAssociations.xlsx",
+  overwrite = TRUE
+)
+
+# Inspect
+head(assoc.tab)
+head(strong.tab)
+head(network.tab)
+```
+
+
+## ########################################################## ##
+##                                                            ##
+##                        THE END!                            ##
+##                                                            ##
+## ########################################################## ##
