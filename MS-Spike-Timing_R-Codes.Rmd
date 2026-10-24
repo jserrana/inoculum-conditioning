@@ -13,8 +13,7 @@ editor_options:
 library("dada2"); packageVersion("dada2") ## For processing amplicon sequence data.
 library("phyloseq"); library("microeco") ## For data manipulation, analysis and visualization. Visit https://github.com/ChiLiubio/microeco for more details.
 
-#setwd("~/Library/Mobile Documents/com~apple~CloudDocs/Documents/(Draft) Spike-Timing/MS-Spike-Timing_Analysis")
-setwd("C:/Users/JoeselleSerrana/iCloudDrive/Documents/(Draft) Spike-Timing/MS-Spike-Timing_Analysis")
+setwd("../MS-Spike-Timing_Analysis")
 
 mco <- readRDS("src/mco.RDS") ## [START FROM STEP 4...] Read microtable object.
 col.type <- c("Field" = "#2CA25F", "Spike" = "#D7301F", "Harvest" = "#756BB1", 
